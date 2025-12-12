@@ -1,0 +1,76 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <title>SmartSteps Dashboard</title>
+    <link rel="stylesheet" href="style.css">
+</head>
+<body>
+
+<div class="dashboard">
+
+    <!-- Header -->
+    <h1 class="title">SmartSteps</h1>
+    <div class="status" id="status">Connecting...</div>
+
+    <!-- Live Step Counter -->
+    <div class="step-card">
+        <div class="step-number" id="stepCount">0</div>
+        <div class="step-label">Steps</div>
+    </div>
+
+    <!-- Goal Progress Ring -->
+    <div class="goal-section">
+        <canvas id="goalRing" width="180" height="180"></canvas>
+        <div class="goal-text">
+            <span id="goalValue">0%</span>
+            <small>Goal Progress</small>
+        </div>
+    </div>
+
+    <!-- Quick Stats -->
+    <div class="stats-row">
+        <div class="stat-box">
+            <div class="stat-value" id="calories">0</div>
+            <div class="stat-label">Calories</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="distance">0 km</div>
+            <div class="stat-label">Distance</div>
+        </div>
+        <div class="stat-box">
+            <div class="stat-value" id="pace">0</div>
+            <div class="stat-label">Steps/min</div>
+        </div>
+    </div>
+
+    <!-- Weekly Chart -->
+    <div class="chart-section">
+        <h2>Weekly Activity</h2>
+        <canvas id="weeklyChart"></canvas>
+    </div>
+
+    <!-- Settings Panel -->
+    <div class="settings-panel">
+        <h2>Settings</h2>
+
+        <label>Step Goal</label>
+        <input type="number" id="goalInput" placeholder="Enter goal">
+
+        <label>Sensitivity</label>
+        <input type="range" id="sensInput" min="1" max="5">
+
+        <button id="resetBtn">Reset Steps</button>
+        <button id="applyBtn">Apply Settings</button>
+    </div>
+
+</div>
+
+<!-- ✅ Correct order of scripts -->
+<script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"></script>
+
+<script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+<script src="script.js"></script>
+
+</body>
+</html>
