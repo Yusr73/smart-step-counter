@@ -1,6 +1,6 @@
 import 'package:flutter/material.dart';
 import 'package:mqtt_client/mqtt_client.dart';
-import 'package:mqtt_client/mqtt_browser_client.dart';
+import 'package:mqtt_client/mqtt_server_client.dart';
 import 'dart:async';
 
 void main() {
@@ -31,7 +31,7 @@ class SmartStepsHomePage extends StatefulWidget {
 }
 
 class _SmartStepsHomePageState extends State<SmartStepsHomePage> {
-  MqttBrowserClient? client;
+  MqttServerClient? client;
   String connectionStatus = 'Déconnecté';
   String stepCount = '0';
   bool isConnecting = false;
@@ -49,15 +49,15 @@ class _SmartStepsHomePageState extends State<SmartStepsHomePage> {
     });
 
     // Créer le client MQTT
-    final clientId = 'webclient-${DateTime.now().millisecondsSinceEpoch}';
-    client = MqttBrowserClient.withPort('wss://broker.emqx.io', clientId, 443);
+    final clientId = 'mobile-${DateTime.now().millisecondsSinceEpoch}';
+    client = MqttServerClient.withPort('broker.emqx.io', clientId, 1883);
     
     // Configuration du client
     client!.logging(on: false);
     client!.keepAlivePeriod = 60;
     client!.onDisconnected = onDisconnected;
     client!.onConnected = onConnected;
-    client!.websocketProtocols = ['mqtt'];
+    client!.autoReconnect = true;
 
     // Message de connexion
     final connMessage = MqttConnectMessage()
