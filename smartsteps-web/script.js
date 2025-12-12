@@ -1,7 +1,6 @@
 // =====================================
 // SmartSteps Dashboard - script.js
-// Works with ESP32 MMA7660 Sketch
-// Uses Paho MQTT over WebSockets
+// MQTT.js version (no Paho)
 // =====================================
 
 // -------------------------------
@@ -30,68 +29,83 @@ const ui = {
 };
 
 // -------------------------------
-// MQTT CLIENT
+// MQTT CLIENT USING MQTT.JS
 // -------------------------------
 console.log("[MQTT] Connecting...");
-const client = new Paho.MQTT.Client(
-    "broker.emqx.io",
-    8084,
-    "/mqtt",
-    "WebDashboard_" + Math.random().toString(16).substr(2, 8)
-);
 
-client.connect({
-    useSSL: true,
-    timeout: 5,
-    onSuccess: () => {
-        console.log("[MQTT] Connected!");
-        ui.status.textContent = "Connected";
-        ui.status.style.color = "green";
-        client.subscribe(TOPIC_STEPS);
-    },
-    onFailure: () => {
-        ui.status.textContent = "Connection Failed";
-        ui.status.style.color = "red";
+const client = mqtt.connect(MQTT_BROKER, {
+    clientId: "WebDashboard_" + Math.random().toString(16).substr(2, 8),
+    clean: true,
+    reconnectPeriod: 2000
+});
+
+client.on("connect", () => {
+    console.log("[MQTT] Connected!");
+    ui.status.textContent = "Connected";
+    ui.status.style.color = "lime";
+    client.subscribe(TOPIC_STEPS);
+});
+
+client.on("reconnect", () => {
+    ui.status.textContent = "Reconnecting...";
+    ui.status.style.color = "orange";
+});
+
+client.on("close", () => {
+    ui.status.textContent = "Disconnected";
+    ui.status.style.color = "red";
+});
+
+client.on("error", (err) => {
+    console.error("[MQTT] Error:", err);
+});
+
+client.on("message", (topic, payload) => {
+    const text = payload.toString();
+    console.log("[MQTT] Message:", text);
+
+    try {
+        const data = JSON.parse(text);
+        handleIncoming(data);
+    } catch (e) {
+        console.error("[MQTT] Invalid JSON:", text);
     }
 });
 
-client.onConnectionLost = () => {
-    ui.status.textContent = "Disconnected";
-    ui.status.style.color = "red";
-};
+// -------------------------------
+// SEND COMMANDS TO ESP32 (MQTT.js)
+// -------------------------------
+function sendCommand(cmd) {
+    if (!client.connected) {
+        console.warn("[MQTT] Not connected, cannot send:", cmd);
+        return;
+    }
 
-client.onMessageArrived = (msg) => {
-    console.log("[MQTT] Message:", msg.payloadString);
-    handleIncoming(JSON.parse(msg.payloadString));
-};
+    client.publish(TOPIC_CONFIG, cmd, { qos: 1 });
+    console.log("[MQTT] Sent:", cmd);
+}
 
 // -------------------------------
 // CALCULATIONS
 // -------------------------------
-
-// ✅ Calories burned (approx): 0.04 kcal per step
 function calcCalories(steps) {
     return (steps * 0.04).toFixed(1);
 }
 
-// ✅ Distance (km): average step length 0.78m
 function calcDistance(steps) {
     return (steps * 0.00078).toFixed(2);
 }
 
-// ✅ Pace (steps/min): based on last 60 seconds
 let paceHistory = [];
 function calcPace(steps) {
     const now = Date.now();
     paceHistory.push({ time: now, steps });
 
-    // keep last 60 seconds
     paceHistory = paceHistory.filter(p => now - p.time <= 60000);
 
     if (paceHistory.length < 2) return 0;
 
-    const diff = paceHistory[paceHistory.length - 1].steps - paceHistory[0].steps;
-    return diff;
+    return paceHistory[paceHistory.length - 1].steps - paceHistory[0].steps;
 }
 
 // -------------------------------
@@ -106,14 +120,12 @@ function drawGoalRing(percent) {
 
     ctx.clearRect(0, 0, 180, 180);
 
-    // background ring
     ctx.beginPath();
     ctx.strokeStyle = "#ddd";
     ctx.lineWidth = 12;
     ctx.arc(center, center, radius, 0, Math.PI * 2);
     ctx.stroke();
 
-    // progress ring
     ctx.beginPath();
     ctx.strokeStyle = "#4CAF50";
     ctx.lineWidth = 12;
@@ -145,8 +157,8 @@ const chart = new Chart(ui.weeklyChart, {
 });
 
 function updateWeeklyChart(steps) {
-    const day = new Date().getDay(); // 0 = Sun
-    const index = (day + 6) % 7;     // convert to Mon=0
+    const day = new Date().getDay();
+    const index = (day + 6) % 7;
     weeklyData[index] = steps;
     chart.update();
 }
@@ -158,37 +170,23 @@ function handleIncoming(data) {
     const steps = data.steps;
     const goal = data.goal;
 
-    // Update UI
     ui.steps.textContent = steps;
 
-    // Calculations
     ui.calories.textContent = calcCalories(steps);
     ui.distance.textContent = calcDistance(steps) + " km";
     ui.pace.textContent = calcPace(steps);
 
-    // Goal ring
     const percent = Math.min(steps / goal, 1);
     drawGoalRing(percent);
 
-    // Weekly chart
     updateWeeklyChart(steps);
 }
 
 // -------------------------------
-// SEND COMMANDS TO ESP32
+// BUTTON HANDLERS
 // -------------------------------
-function sendCommand(cmd) {
-    const msg = new Paho.MQTT.Message(cmd);
-    msg.destinationName = TOPIC_CONFIG;
-    client.send(msg);
-}
+ui.resetBtn.onclick = () => sendCommand("reset");
 
-// Reset button
-ui.resetBtn.onclick = () => {
-    sendCommand("reset");
-};
-
-// Apply settings
 ui.applyBtn.onclick = () => {
     const goal = ui.goalInput.value;
     const sens = ui.sensInput.value;
