@@ -1,29 +1,6 @@
 /*
-  ESP32 Smart Step Counter (BLE Version, full features)
-
-  Replaces WiFi + MQTT with BLE GATT:
-
-  SERVICE: SmartSteps
-    UUID: 0000ABCD-0000-1000-8000-00805F9B34FB
-
-  CHARACTERISTICS:
-    - Steps JSON Notify (like MQTT payload)
-      UUID: 0001ABCD-0000-1000-8000-00805F9B34FB
-      Notify payload example:
-        {"steps":1234,"goal":6000,"goalReachedToday":false,"timestamp":1700000000}
-
-    - Goal Read/Write
-      UUID: 0002ABCD-0000-1000-8000-00805F9B34FB
-
-    - Sensitivity Read/Write
-      UUID: 0003ABCD-0000-1000-8000-00805F9B34FB
-
-    - Command Write
-      UUID: 0004ABCD-0000-1000-8000-00805F9B34FB
-      Commands:
-        "reset"
-        "goal:8000"
-        "sens:1.35"
+  ESP32 Smart Step Counter (BLE Version, full features + RGB Status)
+  Rewritten with Serial monitor fixes
 */
 
 #include <BLEDevice.h>
@@ -37,9 +14,20 @@
 #include <math.h>
 
 /* ----------------------------
-   LED / STATUS (optional)
+   SERIAL DEBUG MACROS (MOVED TO TOP)
 ---------------------------- */
-const int LED_PIN = 2;
+// Use these instead of Serial.print() to ensure output
+#define SERIAL_BEGIN() do { Serial.begin(115200); delay(100); } while(0)
+#define SERIAL_PRINT(x) do { Serial.print(x); Serial.flush(); } while(0)
+#define SERIAL_PRINTLN(x) do { Serial.println(x); Serial.flush(); } while(0)
+#define SERIAL_PRINTF(...) do { Serial.printf(__VA_ARGS__); Serial.flush(); } while(0)
+
+/* ----------------------------
+   RGB LED (COMMON-ANODE)
+---------------------------- */
+#define LED_Red   16
+#define LED_Green 13
+#define LED_Blue  12
 
 /* ----------------------------
    EEPROM LAYOUT
@@ -63,9 +51,8 @@ int  currentDayKey = -1;
 /* ----------------------------
    POWER / SAMPLING CONTROL
 ---------------------------- */
-// You can keep these as in MQTT version if you want modulation:
-uint32_t sampleIntervalMs_beforeGoal = 50;
-uint32_t sampleIntervalMs_afterGoal  = 200;
+uint32_t sampleIntervalMs = 50;
+
 
 uint32_t publishStepsInterval_beforeGoal = 5000;
 uint32_t publishStepsInterval_afterGoal  = 20000;
@@ -99,21 +86,49 @@ const float BAT_V_MAX = 4.20f;
 MMA7660 accel;
 
 bool initAccelerometer() {
-  Serial.println("[ACCEL] Initializing MMA7660...");
+  SERIAL_PRINTLN("[ACCEL] Initializing MMA7660...");
   Wire.begin();
+  
+  // Try I2C scan first
+  SERIAL_PRINTLN("Scanning I2C bus...");
+  byte error, address;
+  int nDevices = 0;
+  for(address = 1; address < 127; address++) {
+    Wire.beginTransmission(address);
+    error = Wire.endTransmission();
+    if (error == 0) {
+      SERIAL_PRINTF("I2C device at 0x%02X\n", address);
+      nDevices++;
+    }
+  }
+  
+  if (nDevices == 0) {
+    SERIAL_PRINTLN("[ACCEL] No I2C devices found!");
+    return false;
+  }
+  
+  // MMA7660 init doesn't return a value, so we just call it
   accel.init();
-
+  delay(100); // Give time to initialize
+  
   int8_t x, y, z;
-  accel.getXYZ(&x, &y, &z);
+  if (accel.getXYZ(&x, &y, &z)) {
+    SERIAL_PRINTF("[ACCEL] Test read: x=%d, y=%d, z=%d\n", x, y, z);
+  } else {
+    SERIAL_PRINTLN("[ACCEL] Failed to read accelerometer!");
+    return false;
+  }
+  
   accel.setSampleRate(64);
-
-  Serial.println("[ACCEL] MMA7660 initialized OK.");
+  SERIAL_PRINTLN("[ACCEL] MMA7660 initialized OK.");
   return true;
 }
 
 bool readAccel(float &ax, float &ay, float &az) {
   int8_t x, y, z;
-  accel.getXYZ(&x, &y, &z);
+  if (!accel.getXYZ(&x, &y, &z)) {
+    return false;
+  }
 
   const float scale = (1.5f / 32.0f) * 9.81f;
   ax = (float)x * scale;
@@ -123,297 +138,364 @@ bool readAccel(float &ax, float &ay, float &az) {
 }
 
 /* ----------------------------
-   LED BLINK HELPERS
+   RGB LED HELPERS
 ---------------------------- */
-void blink(int times, int onMs=120, int offMs=120) {
+void rgbOff() {
+  digitalWrite(LED_Red,   HIGH);
+  digitalWrite(LED_Green, HIGH);
+  digitalWrite(LED_Blue,  HIGH);
+}
+
+void rgbColor(bool r, bool g, bool b) {
+  digitalWrite(LED_Red,   r ? LOW : HIGH);
+  digitalWrite(LED_Green, g ? LOW : HIGH);
+  digitalWrite(LED_Blue,  b ? LOW : HIGH);
+}
+
+void rgbBlink(bool r, bool g, bool b, int times, int onMs=120, int offMs=120) {
   for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH);
+    rgbColor(r, g, b);
     delay(onMs);
-    digitalWrite(LED_PIN, LOW);
+    rgbOff();
     delay(offMs);
   }
 }
 
-void signalError() { blink(1, 600, 250); Serial.println("[LED] ERROR"); }
-void signalReset() { blink(1, 150, 150); Serial.println("[LED] RESET"); }
-void signalGoal()  { blink(5, 90, 90);   Serial.println("[LED] GOAL"); }
-
 /* ----------------------------
-   TIME (NTP-like idea)
-   NOTE: Without WiFi, NTP won't work.
-   Here we show the structure, but in BLE-only mode
-   you either:
-     - skip time-based daily reset, or
-     - set time over BLE from the app.
+   STATUS SIGNALS
 ---------------------------- */
-
-// For now, we keep the structure but without real NTP.
-// You can later add BLE-based time sync if needed.
-bool timeIsValid() {
-  // If you don't have real time, you can disable date logic
-  return false;
+void signalError() {
+  SERIAL_PRINTLN("[SIGNAL] Error (Red blink)");
+  rgbBlink(true, false, false, 1, 600, 250);
 }
 
-int computeDayKey() {
-  if (!timeIsValid()) return -1;
-  time_t now = time(nullptr);
-  struct tm t;
-  localtime_r(&now, &t);
-  return (t.tm_year + 1900) * 1000 + t.tm_yday;
+void signalReset() {
+  SERIAL_PRINTLN("[SIGNAL] Reset (Blue blink)");
+  rgbBlink(false, false, true, 1, 150, 150);
 }
 
-void handleNewDayIfNeeded() {
-  if (!timeIsValid()) return;
-  int dayKey = computeDayKey();
-  if (dayKey < 0) return;
+void signalGoal() {
+  SERIAL_PRINTLN("[SIGNAL] Goal reached (Green blink)");
+  rgbBlink(false, true, false, 5, 90, 90);
+}
 
-  if (currentDayKey == -1) {
-    currentDayKey = dayKey;
-    Serial.printf("[DAY] Initial day key set: %d\n", dayKey);
-    return;
-  }
+void signalAdvertising() {
+  SERIAL_PRINTLN("[SIGNAL] Advertising (Purple)");
+  rgbColor(true, false, true);
+}
 
-  if (dayKey != currentDayKey) {
-    Serial.println("[DAY] New day detected → resetting stepCount");
-    stepCount = 0;
-    goalReachedToday = false;
-    currentDayKey = dayKey;
-  }
+void signalConnected() {
+  SERIAL_PRINTLN("[SIGNAL] Connected (Cyan)");
+  rgbColor(false, true, true);
+}
+
+void signalStepDetected() {
+  // Don't print every step to avoid flooding Serial
+  rgbBlink(true, true, false, 1, 40, 40);
 }
 
 /* ----------------------------
-   EEPROM LOAD/SAVE
+   EEPROM HELPERS
 ---------------------------- */
-template <typename T>
-void eepromWrite(int addr, const T &value) { EEPROM.put(addr, value); }
-
-template <typename T>
-void eepromRead(int addr, T &value) { EEPROM.get(addr, value); }
-
-void loadPersistentConfig() {
+void loadConfigFromEEPROM() {
+  SERIAL_PRINTLN("[EEPROM] Loading config...");
   EEPROM.begin(EEPROM_SIZE);
-
-  uint32_t magic = 0;
-  eepromRead(ADDR_MAGIC, magic);
-
-  if (magic != EEPROM_MAGIC) {
-    Serial.println("[EEPROM] First run → writing defaults");
-    magic = EEPROM_MAGIC;
+  uint32_t storedMagic;
+  EEPROM.get(ADDR_MAGIC, storedMagic);
+  if (storedMagic != EEPROM_MAGIC) {
+    SERIAL_PRINTLN("[EEPROM] No valid config, using defaults");
     stepGoal = 6000;
     sensitivity = 1.25f;
-
-    eepromWrite(ADDR_MAGIC, magic);
-    eepromWrite(ADDR_STEP_GOAL, stepGoal);
-    eepromWrite(ADDR_SENSITIVITY, sensitivity);
+    EEPROM.put(ADDR_MAGIC, EEPROM_MAGIC);
+    EEPROM.put(ADDR_STEP_GOAL, stepGoal);
+    EEPROM.put(ADDR_SENSITIVITY, sensitivity);
     EEPROM.commit();
-    return;
+  } else {
+    EEPROM.get(ADDR_STEP_GOAL, stepGoal);
+    EEPROM.get(ADDR_SENSITIVITY, sensitivity);
+    SERIAL_PRINTF("[EEPROM] Loaded: Goal=%ld, Sensitivity=%.2f\n", stepGoal, sensitivity);
   }
-
-  eepromRead(ADDR_STEP_GOAL, stepGoal);
-  eepromRead(ADDR_SENSITIVITY, sensitivity);
-
-  Serial.printf("[EEPROM] Loaded goal=%d sensitivity=%.2f\n", stepGoal, sensitivity);
+  EEPROM.end();
 }
 
-void saveStepGoal(int32_t newGoal) {
-  stepGoal = newGoal;
-  eepromWrite(ADDR_STEP_GOAL, stepGoal);
+void saveGoalToEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(ADDR_STEP_GOAL, stepGoal);
   EEPROM.commit();
-  Serial.printf("[EEPROM] Goal updated → %d\n", stepGoal);
+  EEPROM.end();
+  SERIAL_PRINTF("[EEPROM] Saved goal: %ld\n", stepGoal);
 }
 
-void saveSensitivity(float newSens) {
-  sensitivity = newSens;
-  eepromWrite(ADDR_SENSITIVITY, sensitivity);
+void saveSensitivityToEEPROM() {
+  EEPROM.begin(EEPROM_SIZE);
+  EEPROM.put(ADDR_SENSITIVITY, sensitivity);
   EEPROM.commit();
-  Serial.printf("[EEPROM] Sensitivity updated → %.2f\n", sensitivity);
+  EEPROM.end();
+  SERIAL_PRINTF("[EEPROM] Saved sensitivity: %.2f\n", sensitivity);
 }
+
 
 /* ----------------------------
    STEP DETECTION LOGIC
 ---------------------------- */
-bool detectStepFromAccel(float ax, float ay, float az, uint32_t nowMs) {
-  float mag = sqrtf(ax*ax + ay*ay + az*az);
+bool detectStep(float ax, float ay, float az, uint32_t nowMs) {
+  const float mag = sqrtf(ax * ax + ay * ay + az * az);
 
-  const float alpha = 0.90f;
+  const float alpha = 0.9f;
   g_est = alpha * g_est + (1.0f - alpha) * mag;
+  const float hp = mag - g_est;
 
-  float hp = mag - g_est;
+  bool isStep = false;
 
-  bool crossingUp = (prev_hp <= sensitivity) && (hp > sensitivity);
-  bool okSpike = (hp < 50.0f);
-  bool okTiming = (nowMs - lastStepMs) >= minStepIntervalMs;
+  if (prev_hp <= sensitivity && hp > sensitivity) {
+    if (hp < 50.0f) {
+      if (nowMs - lastStepMs >= minStepIntervalMs) {
+        isStep = true;
+        lastStepMs = nowMs;
+        stepCount++;
+        
+        // Print only every 10 steps to avoid flooding Serial
+        if (stepCount % 10 == 0) {
+          SERIAL_PRINTF("[STEP] Steps: %lu (HP=%.2f)\n", stepCount, hp);
+        }
+        
+        signalStepDetected();
+
+        if (!goalReachedToday && stepCount >= (uint32_t)stepGoal) {
+          goalReachedToday = true;
+          SERIAL_PRINTLN("[STEP] GOAL REACHED!");
+          signalGoal();
+        }
+      }
+    }
+  }
 
   prev_hp = hp;
-
-  if (crossingUp && okSpike && okTiming) {
-    Serial.printf("[STEP] Detected | hp=%.2f | ax=%.2f ay=%.2f az=%.2f\n",
-                  hp, ax, ay, az);
-    lastStepMs = nowMs;
-    return true;
-  }
-  return false;
+  return isStep;
 }
 
 /* ----------------------------
-   GOAL HANDLING
+   BATTERY READING
 ---------------------------- */
-void handleGoalLogic() {
-  if (!goalReachedToday && stepCount >= (uint32_t)stepGoal) {
-    Serial.println("[GOAL] Goal reached!");
-    goalReachedToday = true;
-    signalGoal();
-  }
+float readBatteryVoltage() {
+  if (!BATTERY_ENABLED) return -1.0f;
+  int raw = analogRead(BAT_ADC_PIN);
+  float v = ((float)raw / 4095.0f) * ADC_REF_V * DIVIDER_RATIO;
+  SERIAL_PRINTF("[BAT] Voltage: %.2fV (raw=%d)\n", v, raw);
+  return v;
 }
 
 /* ----------------------------
-   BLE OBJECTS
+   BLE GATT DEFINITIONS
 ---------------------------- */
-BLECharacteristic* stepsJsonChar = nullptr;
-BLECharacteristic* goalChar      = nullptr;
-BLECharacteristic* sensChar      = nullptr;
-BLECharacteristic* cmdChar       = nullptr;
+#define SMARTSTEPS_SERVICE_UUID        "0000abcd-0000-1000-8000-00805f9b34fb"
+#define STEPS_JSON_CHAR_UUID           "0001abcd-0000-1000-8000-00805f9b34fb"
+#define GOAL_RW_CHAR_UUID              "0002abcd-0000-1000-8000-00805f9b34fb"
+#define SENSITIVITY_RW_CHAR_UUID       "0003abcd-0000-1000-8000-00805f9b34fb"
+#define COMMAND_W_CHAR_UUID            "0004abcd-0000-1000-8000-00805f9b34fb"
 
-bool bleClientConnected = false;
+BLEServer *pServer = nullptr;
+BLECharacteristic *pStepsJsonChar = nullptr;
+BLECharacteristic *pGoalChar = nullptr;
+BLECharacteristic *pSensChar = nullptr;
+BLECharacteristic *pCmdChar = nullptr;
 
-class ServerCallbacks : public BLEServerCallbacks {
-  void onConnect(BLEServer* pServer) override {
-    bleClientConnected = true;
-    Serial.println("[BLE] Client connected");
+bool bleDeviceConnected = false;
+
+/* ----------------------------
+   BLE CALLBACKS
+---------------------------- */
+class MyServerCallbacks : public BLEServerCallbacks {
+  void onConnect(BLEServer *pServer) override {
+    bleDeviceConnected = true;
+    SERIAL_PRINTLN("[BLE] Device Connected!");
+    signalConnected();
   }
-
-  void onDisconnect(BLEServer* pServer) override {
-    bleClientConnected = false;
-    Serial.println("[BLE] Client disconnected");
-    BLEDevice::startAdvertising();
+  
+  void onDisconnect(BLEServer *pServer) override {
+    bleDeviceConnected = false;
+    SERIAL_PRINTLN("[BLE] Device Disconnected, restarting advertising");
+    pServer->getAdvertising()->start();
+    signalAdvertising();
   }
 };
 
-class CommandCallbacks : public BLECharacteristicCallbacks {
-  void onWrite(BLECharacteristic* pCharacteristic) override {
+class GoalCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
     String value = pCharacteristic->getValue();
+    if (value.length() == 0) return;
 
-    if (value.isEmpty()) return;
+    SERIAL_PRINTF("[BLE] Goal write: %s\n", value.c_str());
+    
+    for (unsigned int i = 0; i < value.length(); i++) {
+      if (value[i] < '0' || value[i] > '9') return;
+    }
 
-    String cmd = String(value.c_str());
-    Serial.printf("[CMD] Received: %s\n", cmd.c_str());
+    int newGoal = value.toInt();
+    if (newGoal <= 0) return;
 
-    cmd.trim();
-    if (cmd.equalsIgnoreCase("reset")) {
-      Serial.println("[CMD] RESET triggered");
+    stepGoal = newGoal;
+    saveGoalToEEPROM();
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%ld", (long)stepGoal);
+    pGoalChar->setValue(buf);
+  }
+};
+
+class SensCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String value = pCharacteristic->getValue();
+    if (value.length() == 0) return;
+
+    SERIAL_PRINTF("[BLE] Sensitivity write: %s\n", value.c_str());
+    
+    float f = value.toFloat();
+    if (f <= 0.0f || f > 20.0f) return;
+
+    sensitivity = f;
+    saveSensitivityToEEPROM();
+
+    char buf[16];
+    snprintf(buf, sizeof(buf), "%.3f", sensitivity);
+    pSensChar->setValue(buf);
+  }
+};
+
+class CommandCharCallbacks : public BLECharacteristicCallbacks {
+  void onWrite(BLECharacteristic *pCharacteristic) override {
+    String cmd = pCharacteristic->getValue();
+    if (cmd.length() == 0) return;
+
+    SERIAL_PRINTF("[BLE] Command received: %s\n", cmd.c_str());
+    
+    if (cmd == "reset") {
       stepCount = 0;
       goalReachedToday = false;
+      SERIAL_PRINTLN("[CMD] Steps reset to 0");
       signalReset();
-      return;
     }
-
-    if (cmd.startsWith("goal:")) {
-      int32_t g = cmd.substring(5).toInt();
-      saveStepGoal(g);
-      if (goalChar) {
-        goalChar->setValue(String(stepGoal).c_str());
+    else if (cmd.startsWith("goal:")) {
+      int newGoal = cmd.substring(5).toInt();
+      if (newGoal > 0) {
+        stepGoal = newGoal;
+        saveGoalToEEPROM();
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%ld", (long)stepGoal);
+        pGoalChar->setValue(buf);
+        SERIAL_PRINTF("[CMD] Goal changed to: %ld\n", stepGoal);
       }
-      return;
     }
-
-    if (cmd.startsWith("sens:")) {
+    else if (cmd.startsWith("sens:")) {
       float s = cmd.substring(5).toFloat();
-      saveSensitivity(s);
-      if (sensChar) {
-        sensChar->setValue(String(sensitivity, 2).c_str());
+      if (s > 0.0f && s <= 20.0f) {
+        sensitivity = s;
+        saveSensitivityToEEPROM();
+        char buf[16];
+        snprintf(buf, sizeof(buf), "%.3f", sensitivity);
+        pSensChar->setValue(buf);
+        SERIAL_PRINTF("[CMD] Sensitivity changed to: %.2f\n", sensitivity);
       }
-      return;
     }
-
-    Serial.println("[CMD] Unknown command");
   }
 };
 
 /* ----------------------------
-   BLE INIT
+   BLE SETUP
 ---------------------------- */
-void initBLE() {
-  Serial.println("[BLE] Initializing...");
-
+void setupBLE() {
+  SERIAL_PRINTLN("[BLE] Initializing...");
+  
   BLEDevice::init("SmartSteps BLE");
-  BLEServer* server = BLEDevice::createServer();
-  server->setCallbacks(new ServerCallbacks());
+  SERIAL_PRINTLN("[BLE] Device initialized");
 
-  BLEService* service = server->createService("0000ABCD-0000-1000-8000-00805F9B34FB");
+  pServer = BLEDevice::createServer();
+  pServer->setCallbacks(new MyServerCallbacks());
+  SERIAL_PRINTLN("[BLE] Server created");
 
-  stepsJsonChar = service->createCharacteristic(
-    "0001ABCD-0000-1000-8000-00805F9B34FB",
-    BLECharacteristic::PROPERTY_NOTIFY
+  BLEService *pService = pServer->createService(SMARTSTEPS_SERVICE_UUID);
+  SERIAL_PRINTLN("[BLE] Service created");
+
+  pStepsJsonChar = pService->createCharacteristic(
+      STEPS_JSON_CHAR_UUID,
+      BLECharacteristic::PROPERTY_NOTIFY
   );
 
-  goalChar = service->createCharacteristic(
-    "0002ABCD-0000-1000-8000-00805F9B34FB",
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+  pGoalChar = pService->createCharacteristic(
+      GOAL_RW_CHAR_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
-  sensChar = service->createCharacteristic(
-    "0003ABCD-0000-1000-8000-00805F9B34FB",
-    BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
+  pSensChar = pService->createCharacteristic(
+      SENSITIVITY_RW_CHAR_UUID,
+      BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
-  cmdChar = service->createCharacteristic(
-    "0004ABCD-0000-1000-8000-00805F9B34FB",
-    BLECharacteristic::PROPERTY_WRITE
+  pCmdChar = pService->createCharacteristic(
+      COMMAND_W_CHAR_UUID,
+      BLECharacteristic::PROPERTY_WRITE
   );
 
-  cmdChar->setCallbacks(new CommandCallbacks());
+  pGoalChar->setCallbacks(new GoalCharCallbacks());
+  pSensChar->setCallbacks(new SensCharCallbacks());
+  pCmdChar->setCallbacks(new CommandCharCallbacks());
 
-  // Initial values for read characteristics
-  goalChar->setValue(String(stepGoal).c_str());
-  sensChar->setValue(String(sensitivity, 2).c_str());
+  char bufG[16], bufS[16];
+  snprintf(bufG, sizeof(bufG), "%ld", (long)stepGoal);
+  snprintf(bufS, sizeof(bufS), "%.3f", sensitivity);
+  pGoalChar->setValue(bufG);
+  pSensChar->setValue(bufS);
 
-  service->start();
+  pService->start();
+  SERIAL_PRINTLN("[BLE] Service started");
 
-  BLEAdvertising* adv = BLEDevice::getAdvertising();
-  adv->addServiceUUID("0000ABCD-0000-1000-8000-00805F9B34FB");
-  adv->setScanResponse(true);
-  adv->setMinPreferred(0x06);
-  adv->setMinPreferred(0x12);
+  BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
+  pAdvertising->addServiceUUID(SMARTSTEPS_SERVICE_UUID);
+  pAdvertising->setScanResponse(false);
+  pAdvertising->setMinPreferred(0x06);
+  pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
 
-  Serial.println("[BLE] Advertising started");
+  SERIAL_PRINTLN("[BLE] Advertising started");
+  signalAdvertising();
 }
 
 /* ----------------------------
-   BLE "publish" (JSON notify)
+   STEPS JSON PUBLISH
 ---------------------------- */
-void bleNotifyStepsJson() {
-  if (!bleClientConnected || !stepsJsonChar) return;
+void publishStepsJson(uint32_t nowMs) {
+  if (!bleDeviceConnected) {
+    return;
+  }
 
-  // We no longer have valid time without WiFi; timestamp can be 0 or millis.
-  uint32_t ts = 0; // or millis() if you want relative time
+  static char jsonBuf[128];
+  snprintf(
+      jsonBuf,
+      sizeof(jsonBuf),
+      "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"timestamp\":%lu}",
+      (unsigned long)stepCount,
+      (long)stepGoal,
+      goalReachedToday ? "true" : "false",
+      (unsigned long)(nowMs / 1000UL)
+  );
 
-  String json = "{";
-  json += "\"steps\":" + String(stepCount) + ",";
-  json += "\"goal\":" + String(stepGoal) + ",";
-  json += "\"goalReachedToday\":" + String(goalReachedToday ? "true" : "false") + ",";
-  json += "\"timestamp\":" + String(ts);
-  json += "}";
-
-  Serial.print("[BLE] Notify: ");
-  Serial.println(json);
-
-  stepsJsonChar->setValue(json.c_str());
-  stepsJsonChar->notify();
+  SERIAL_PRINTF("[BLE] Publishing JSON: %s\n", jsonBuf);
+  
+  pStepsJsonChar->setValue((uint8_t *)jsonBuf, strlen(jsonBuf));
+  pStepsJsonChar->notify();
 }
 
 /* ----------------------------
-   BATTERY PUBLISH (optional)
-   For now, we can reuse same JSON or add another char if needed.
+   BATTERY PUBLISH
 ---------------------------- */
 void publishBatteryIfNeeded(uint32_t nowMs) {
   if (!BATTERY_ENABLED) return;
+  if (!bleDeviceConnected) return;
 
   if (nowMs - lastPublishBatteryMs >= publishBatteryIntervalMs) {
     lastPublishBatteryMs = nowMs;
-
-    // You can measure battery here and include it in JSON (extend JSON or another char)
-    // For now, we won't implement full battery to keep it aligned.
+    float v = readBatteryVoltage();
+    // Battery voltage could be sent via BLE if needed
   }
 }
 
@@ -421,66 +503,95 @@ void publishBatteryIfNeeded(uint32_t nowMs) {
    SETUP
 ---------------------------- */
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
-
-  Serial.begin(115200);
-  delay(200);
-
-  Serial.println("\n=== SMART STEPS ESP32 (BLE) STARTUP ===");
-
-  loadPersistentConfig();
-
+  // Initialize Serial with proper delay
+  SERIAL_BEGIN();
+  delay(3000);  // Critical: Wait for Serial monitor
+  
+  SERIAL_PRINTLN("\n\n==================================");
+  SERIAL_PRINTLN("   Smart Steps BLE - ESP32");
+  SERIAL_PRINTLN("==================================");
+  SERIAL_PRINTF("Free Heap: %d bytes\n", ESP.getFreeHeap());
+  SERIAL_PRINTF("CPU Freq: %d MHz\n", ESP.getCpuFreqMHz());
+  
+  // Initialize LEDs
+  pinMode(LED_Red, OUTPUT);
+  pinMode(LED_Green, OUTPUT);
+  pinMode(LED_Blue, OUTPUT);
+  rgbOff();
+  SERIAL_PRINTLN("LEDs initialized");
+  
+  // Load configuration
+  loadConfigFromEEPROM();
+  
+  // Initialize accelerometer
+  SERIAL_PRINTLN("Initializing accelerometer...");
   if (!initAccelerometer()) {
-    Serial.println("[FATAL] Accelerometer missing");
-    while (true) {
-      signalError();
-      delay(500);
+    SERIAL_PRINTLN("FATAL: Accelerometer failed!");
+    signalError();
+    while(1) {
+      delay(1000);
+      SERIAL_PRINTLN("Stuck in error state - check accelerometer wiring");
     }
   }
-
-  // Time / NTP disabled for pure BLE version; you can add BLE time sync later
-  currentDayKey = computeDayKey();
-  if (currentDayKey != -1) {
-    Serial.printf("[DAY] Current day key = %d\n", currentDayKey);
-  } else {
-    Serial.println("[DAY] Time not valid, day logic disabled");
-  }
-
-  initBLE();
+  
+  
+  
+  // Initialize BLE
+  SERIAL_PRINTLN("Initializing BLE...");
+  setupBLE();
+  
+  // Initialize timers
+  lastSampleMs = millis();
+  lastPublishStepsMs = millis();
+  lastPublishBatteryMs = millis();
+  
+  SERIAL_PRINTLN("\n=== SETUP COMPLETE ===");
+  SERIAL_PRINTLN("System ready. Waiting for BLE connection...\n");
 }
 
 /* ----------------------------
-   LOOP
+   MAIN LOOP
 ---------------------------- */
 void loop() {
-  handleNewDayIfNeeded();
-
+  static uint32_t lastHeartbeatMs = 0;
   uint32_t nowMs = millis();
-  uint32_t sampleInterval = goalReachedToday ? sampleIntervalMs_afterGoal : sampleIntervalMs_beforeGoal;
+  
+  // Heartbeat every 10 seconds
+  if (nowMs - lastHeartbeatMs >= 10000) {
+    lastHeartbeatMs = nowMs;
+    SERIAL_PRINTF("[HEARTBEAT] Steps: %lu, Goal: %ld, Reached: %d, Connected: %d, Free Heap: %d\n", 
+                  stepCount, stepGoal, goalReachedToday, bleDeviceConnected, ESP.getFreeHeap());
+  }
+  
+ 
+  
+  // Determine sampling rate
+  uint32_t sampleInterval =  sampleIntervalMs;
 
+  
+  // Sample accelerometer
   if (nowMs - lastSampleMs >= sampleInterval) {
     lastSampleMs = nowMs;
-
     float ax, ay, az;
     if (readAccel(ax, ay, az)) {
-      if (detectStepFromAccel(ax, ay, az, nowMs)) {
-        stepCount++;
-        Serial.printf("[STEP] stepCount=%u\n", stepCount);
-        handleGoalLogic();
-      }
+      detectStep(ax, ay, az, nowMs);
+    } else {
+      SERIAL_PRINTLN("[ERROR] Failed to read accelerometer!");
     }
   }
-
-  uint32_t stepsPubInterval = goalReachedToday ? publishStepsInterval_afterGoal : publishStepsInterval_beforeGoal;
-
-  if (nowMs - lastPublishStepsMs >= stepsPubInterval) {
+  
+  // Publish steps via BLE
+  uint32_t publishInterval = goalReachedToday ? publishStepsInterval_afterGoal
+                                              : publishStepsInterval_beforeGoal;
+  
+  if (nowMs - lastPublishStepsMs >= publishInterval) {
     lastPublishStepsMs = nowMs;
-    bleNotifyStepsJson();
+    publishStepsJson(nowMs);
   }
-
+  
+  // Handle battery monitoring
   publishBatteryIfNeeded(nowMs);
-
-  // BLE library handles events internally, no client.loop() needed
-  delay(5);
+  
+  // Small delay to prevent watchdog issues
+  delay(1);
 }
