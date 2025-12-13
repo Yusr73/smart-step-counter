@@ -6,6 +6,7 @@
 #include <BLEDevice.h>
 #include <BLEUtils.h>
 #include <BLEServer.h>
+#include <BLE2902.h> 
 
 #include <Wire.h>
 #include <MMA7660.h>
@@ -416,50 +417,69 @@ void setupBLE() {
   BLEService *pService = pServer->createService(SMARTSTEPS_SERVICE_UUID);
   SERIAL_PRINTLN("[BLE] Service created");
 
+  // FIX 1: Steps characteristic with READ + NOTIFY
   pStepsJsonChar = pService->createCharacteristic(
       STEPS_JSON_CHAR_UUID,
-      BLECharacteristic::PROPERTY_NOTIFY
+      BLECharacteristic::PROPERTY_NOTIFY | 
+      BLECharacteristic::PROPERTY_READ
   );
+  pStepsJsonChar->addDescriptor(new BLE2902());
+  SERIAL_PRINTLN("[BLE] Steps characteristic created (NOTIFY+READ)");
 
+  // Goal characteristic (already correct)
   pGoalChar = pService->createCharacteristic(
       GOAL_RW_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
+  // Sensitivity characteristic (already correct)
   pSensChar = pService->createCharacteristic(
       SENSITIVITY_RW_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
+  // FIX 2: Command characteristic with WRITE + WRITE_NR
   pCmdChar = pService->createCharacteristic(
       COMMAND_W_CHAR_UUID,
-      BLECharacteristic::PROPERTY_WRITE
+      BLECharacteristic::PROPERTY_WRITE | 
+      BLECharacteristic::PROPERTY_WRITE_NR
   );
 
   pGoalChar->setCallbacks(new GoalCharCallbacks());
   pSensChar->setCallbacks(new SensCharCallbacks());
   pCmdChar->setCallbacks(new CommandCharCallbacks());
 
+  // Set initial values for ALL characteristics
   char bufG[16], bufS[16];
   snprintf(bufG, sizeof(bufG), "%ld", (long)stepGoal);
   snprintf(bufS, sizeof(bufS), "%.3f", sensitivity);
   pGoalChar->setValue(bufG);
   pSensChar->setValue(bufS);
+  
+  // FIX 3: Set initial value for steps characteristic
+  char stepsBuf[64];
+  snprintf(stepsBuf, sizeof(stepsBuf), 
+           "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":false,\"timestamp\":0}",
+           stepCount, stepGoal);
+  pStepsJsonChar->setValue(stepsBuf);
+  
+  // Also set an empty value for command characteristic
+  pCmdChar->setValue("");
 
   pService->start();
   SERIAL_PRINTLN("[BLE] Service started");
 
   BLEAdvertising *pAdvertising = BLEDevice::getAdvertising();
   pAdvertising->addServiceUUID(SMARTSTEPS_SERVICE_UUID);
-  pAdvertising->setScanResponse(false);
+  pAdvertising->setScanResponse(true);
   pAdvertising->setMinPreferred(0x06);
   pAdvertising->setMinPreferred(0x12);
   BLEDevice::startAdvertising();
 
   SERIAL_PRINTLN("[BLE] Advertising started");
   signalAdvertising();
+   debugBLECharacteristics();
 }
-
 /* ----------------------------
    STEPS JSON PUBLISH
 ---------------------------- */
@@ -498,6 +518,42 @@ void publishBatteryIfNeeded(uint32_t nowMs) {
     // Battery voltage could be sent via BLE if needed
   }
 }
+void debugBLECharacteristics() {
+    SERIAL_PRINTLN("\n=== ESP32 BLE DEBUG ===");
+    
+    // Just print what we know from our own pointers
+    SERIAL_PRINTLN("1. Steps Characteristic:");
+    if (pStepsJsonChar) {
+        uint16_t props = pStepsJsonChar->getProperties();
+        SERIAL_PRINTF("   Properties: 0x%04X\n", props);
+        SERIAL_PRINT("   Decoded: ");
+        if (props & 0x02) SERIAL_PRINT("READ ");
+        if (props & 0x04) SERIAL_PRINT("WRITE_NR ");
+        if (props & 0x08) SERIAL_PRINT("WRITE ");
+        if (props & 0x10) SERIAL_PRINT("NOTIFY ");
+        if (props & 0x20) SERIAL_PRINT("INDICATE ");
+        SERIAL_PRINTLN();
+    } else {
+        SERIAL_PRINTLN("   ERROR: NULL pointer!");
+    }
+    
+    SERIAL_PRINTLN("\n2. Command Characteristic:");
+    if (pCmdChar) {
+        uint16_t props = pCmdChar->getProperties();
+        SERIAL_PRINTF("   Properties: 0x%04X\n", props);
+        SERIAL_PRINT("   Decoded: ");
+        if (props & 0x02) SERIAL_PRINT("READ ");
+        if (props & 0x04) SERIAL_PRINT("WRITE_NR ");
+        if (props & 0x08) SERIAL_PRINT("WRITE ");
+        if (props & 0x10) SERIAL_PRINT("NOTIFY ");
+        if (props & 0x20) SERIAL_PRINT("INDICATE ");
+        SERIAL_PRINTLN();
+    } else {
+        SERIAL_PRINTLN("   ERROR: NULL pointer!");
+    }
+    
+    SERIAL_PRINTLN("========================\n");
+}
 
 /* ----------------------------
    SETUP
@@ -534,7 +590,8 @@ void setup() {
     }
   }
   
-  
+  // Initialize day counter (simple version)
+  currentDayKey = -1;  // Placeholder - no real time tracking
   
   // Initialize BLE
   SERIAL_PRINTLN("Initializing BLE...");
@@ -548,7 +605,6 @@ void setup() {
   SERIAL_PRINTLN("\n=== SETUP COMPLETE ===");
   SERIAL_PRINTLN("System ready. Waiting for BLE connection...\n");
 }
-
 /* ----------------------------
    MAIN LOOP
 ---------------------------- */
