@@ -11,7 +11,20 @@
 
     <!-- Header -->
     <h1 class="title">SmartSteps</h1>
-    <div class="status" id="status">Connecting...</div>
+    
+    <!-- Status and Battery -->
+    <div class="status-bar">
+        <div class="status" id="status">Connecting...</div>
+        <div class="battery-status" id="batteryStatus">
+            <span class="battery-icon">🔋</span>
+            <span class="battery-value" id="batteryValue">--%</span>
+        </div>
+    </div>
+    
+    <!-- Goal Achievement Badge -->
+    <div class="achievement-badge" id="achievementBadge">
+        🎯 Goal Achieved Today!
+    </div>
 
     <!-- Live Step Counter -->
     <div class="step-card">
@@ -68,7 +81,6 @@
 
 <!-- ✅ Correct order of scripts -->
 <script src="https://cdn.jsdelivr.net/npm/mqtt/dist/mqtt.min.js"></script>
-
 <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
 <script src="script.js"></script>
 

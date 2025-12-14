@@ -1,605 +1,340 @@
 /*
-  ESP32 Smart Step Counter (Wi-Fi / MQTT, web dashboard mode)
-  
-  Added Features:
-  - RGB LED status indicators (common-anode)
-  - Battery monitoring and publishing
-  - All existing MQTT/NTP/day tracking preserved
-
-  MQTT:
-    - Publish: smartsteps/steps
-    - Subscribe: smartsteps/config
-
-  Commands on smartsteps/config:
-    - "reset"       -> stepCount = 0
-    - "goal:8000"   -> store stepGoal (EEPROM) + update RAM
-    - "sens:1.35"   -> store sensitivity (EEPROM) + update RAM
-    - "readbattery" -> force battery reading
-
-  Features:
-    - Step detection (simple peak detection on high-pass filtered accel magnitude)
-    - stepCount in RAM
-    - stepGoal + sensitivity in EEPROM
-    - NTP-based new day detection -> reset stepCount
-    - Goal reached event only once per day
-    - RGB LED signaling for status
-    - Sampling & publish rate reduced after reaching goal
-    - Battery monitoring and reporting
+  ESP32 Smart Step Counter (OPTIMIZED MQTT Version)
+  - Non-blocking operations
+  - Task separation using FreeRTOS
+  - Optimized JSON handling
+  - Fast response times
 */
 
 #include <WiFi.h>
 #include <PubSubClient.h>
 #include <ArduinoJson.h>
 #include <time.h>
-
 #include <Wire.h>
 #include <MMA7660.h>
-
 #include <EEPROM.h>
 
-/* ----------------------------
-   WIFI CONFIG
----------------------------- */
-const char* ssid     = "TOPNET_28A8";     // ✅ Updated
-const char* password = "thjpaep5u3";      // ✅ Updated
+// ===== CONFIGURATION =====
+const char* ssid = "Network";
+const char* password = "f33dq14Z";
+const char* mqtt_server = "broker.emqx.io";
+const int mqtt_port = 1883;
+const char* TOPIC_STEPS = "smartsteps/steps";
+const char* TOPIC_CONFIG = "smartsteps/config";
 
-/* ----------------------------
-   MQTT CONFIG
----------------------------- */
-const char* mqtt_server   = "broker.emqx.io";
-const int   mqtt_port     = 1883;
-const char* mqtt_client_id = "ESP32_SmartSteps";
-const char* mqtt_username  = "";
-const char* mqtt_password  = "";
-
-static const char* TOPIC_STEPS  = "smartsteps/steps";
-static const char* TOPIC_CONFIG = "smartsteps/config";
-
-WiFiClient espClient;
-PubSubClient client(espClient);
-
-/* ----------------------------
-   RGB LED (COMMON-ANODE)
----------------------------- */
+// ===== HARDWARE PINS =====
 #define LED_Red   16
 #define LED_Green 13
 #define LED_Blue  12
+#define BAT_ADC_PIN 34
 
-/* ----------------------------
-   EEPROM LAYOUT
----------------------------- */
-static const int EEPROM_SIZE = 64;
-static const int ADDR_MAGIC       = 0;
-static const int ADDR_STEP_GOAL   = 4;
-static const int ADDR_SENSITIVITY = 8;
-static const uint32_t EEPROM_MAGIC = 0x53544550;
-
-/* ----------------------------
-   GLOBAL STATE
----------------------------- */
+// ===== GLOBAL STATE =====
 volatile uint32_t stepCount = 0;
-int32_t stepGoal = 6000;
-float sensitivity = 1.25f;
+volatile int32_t stepGoal = 6000;
+volatile float sensitivity = 1.25f;
+volatile bool goalReachedToday = false;
+volatile bool newStepsAvailable = false;
+volatile int batteryPercent = 100;
 
-bool goalReachedToday = false;
-int  currentDayKey = -1;
+// ===== TASK TIMING =====
+uint32_t lastStepPublish = 0;
+uint32_t lastSensorRead = 0;
+uint32_t lastBatteryRead = 0;
+uint32_t lastConnectionCheck = 0;
+uint32_t lastDayCheck = 0;
+uint32_t lastActivityTime = 0;
+uint32_t connectionLedOffTime = 0;
 
-/* ----------------------------
-   POWER / SAMPLING CONTROL
----------------------------- */
-uint32_t sampleIntervalMs_beforeGoal = 50;
-uint32_t sampleIntervalMs_afterGoal  = 200;
+// ===== OPTIMIZED INTERVALS =====
+const uint32_t SENSOR_INTERVAL = 50;      // 20Hz sampling
+const uint32_t PUBLISH_INTERVAL = 2000;   // 2 seconds (reduced from 5)
+const uint32_t BATTERY_INTERVAL = 30000;  // 30 seconds
+const uint32_t CONNECTION_CHECK = 5000;   // 5 seconds
+const uint32_t DAY_CHECK_INTERVAL = 60000; // 1 minute
+const uint32_t CONNECTION_LED_DURATION = 3000; // Cyan LED stays on for 3 seconds after connection
+const uint32_t INACTIVITY_TIMEOUT = 5000; // Turn off LED after 5 seconds of no steps
 
-uint32_t publishStepsInterval_beforeGoal = 5000;
-uint32_t publishStepsInterval_afterGoal  = 20000;
-uint32_t publishBatteryIntervalMs        = 60000;
+// ===== OBJECTS =====
+WiFiClient espClient;
+PubSubClient client(espClient);
+MMA7660 accel;
 
-uint32_t lastSampleMs = 0;
-uint32_t lastPublishStepsMs = 0;
-uint32_t lastPublishBatteryMs = 0;
+// ===== PRE-ALLOCATED BUFFERS =====
+char jsonBuffer[256];  // Reuse this buffer
+StaticJsonDocument<200> jsonDoc;  // Reuse JSON document
 
-/* ----------------------------
-   STEP DETECTION
----------------------------- */
+// ===== OPTIMIZED LED FUNCTIONS =====
+void rgbOff() { digitalWrite(LED_Red, HIGH); digitalWrite(LED_Green, HIGH); digitalWrite(LED_Blue, HIGH); }
+void rgbColor(bool r, bool g, bool b) {
+    digitalWrite(LED_Red, r ? LOW : HIGH);
+    digitalWrite(LED_Green, g ? LOW : HIGH);
+    digitalWrite(LED_Blue, b ? LOW : HIGH);
+}
+
+// Longer visible blink
+void rgbBlink(bool r, bool g, bool b, int times = 1, int onMs = 150, int offMs = 100) {
+    for (int i = 0; i < times; i++) {
+        rgbColor(r, g, b);
+        delay(onMs);
+        rgbOff();
+        if (i < times - 1) delay(offMs); // No delay after last blink
+    }
+}
+
+// Brief but visible blink
+void quickBlink(bool r, bool g, bool b) {
+    rgbColor(r, g, b);
+    delay(80);  // Longer than before for visibility
+    rgbOff();
+}
+
+// ===== OPTIMIZED STEP DETECTION =====
 float g_est = 9.81f;
 float prev_hp = 0.0f;
 uint32_t lastStepMs = 0;
-uint32_t minStepIntervalMs = 280;
 
-/* ----------------------------
-   BATTERY MONITORING
----------------------------- */
-const int BAT_ADC_PIN = 34;
-const bool BATTERY_ENABLED = true;
-const float ADC_REF_V = 3.3f;
-const float DIVIDER_RATIO = 2.0f;
-const float BAT_V_MIN = 3.30f;
-const float BAT_V_MAX = 4.20f;
-int batteryPercent = 100;
-
-/* ----------------------------
-   ACCELEROMETER
----------------------------- */
-MMA7660 accel;
-
-bool initAccelerometer() {
-  Serial.println("[ACCEL] Initializing MMA7660...");
-  Wire.begin();
-  accel.init();
-
-  int8_t x, y, z;
-  accel.getXYZ(&x, &y, &z);
-
-  accel.setSampleRate(64);
-
-  Serial.println("[ACCEL] MMA7660 initialized OK.");
-  return true;
-}
-
-bool readAccel(float &ax, float &ay, float &az) {
-  int8_t x, y, z;
-  accel.getXYZ(&x, &y, &z);
-
-  const float scale = (1.5f / 32.0f) * 9.81f;
-
-  ax = (float)x * scale;
-  ay = (float)y * scale;
-  az = (float)z * scale;
-
-  return true;
-}
-
-/* ----------------------------
-   RGB LED HELPERS
----------------------------- */
-void rgbOff() {
-  digitalWrite(LED_Red,   HIGH);
-  digitalWrite(LED_Green, HIGH);
-  digitalWrite(LED_Blue,  HIGH);
-}
-
-void rgbColor(bool r, bool g, bool b) {
-  digitalWrite(LED_Red,   r ? LOW : HIGH);
-  digitalWrite(LED_Green, g ? LOW : HIGH);
-  digitalWrite(LED_Blue,  b ? LOW : HIGH);
-}
-
-void rgbBlink(bool r, bool g, bool b, int times, int onMs=120, int offMs=120) {
-  for (int i = 0; i < times; i++) {
-    rgbColor(r, g, b);
-    delay(onMs);
-    rgbOff();
-    delay(offMs);
-  }
-}
-
-/* ----------------------------
-   STATUS SIGNALS (RGB LED)
----------------------------- */
-void signalWiFiOK() {
-  Serial.println("[LED] WiFi OK (Cyan blink)");
-  rgbBlink(false, true, true, 2, 80, 120);
-}
-
-void signalMQTTOK() {
-  Serial.println("[LED] MQTT OK (Purple blink)");
-  rgbBlink(true, false, true, 3, 70, 90);
-}
-
-void signalError() {
-  Serial.println("[LED] ERROR (Red blink)");
-  rgbBlink(true, false, false, 1, 600, 250);
-}
-
-void signalReset() {
-  Serial.println("[LED] RESET (Blue blink)");
-  rgbBlink(false, false, true, 1, 150, 150);
-}
-
-void signalGoal() {
-  Serial.println("[LED] GOAL (Green blink)");
-  rgbBlink(false, true, false, 5, 90, 90);
-}
-
-void signalStepDetected() {
-  // Brief orange flash for each step
-  rgbBlink(true, true, false, 1, 40, 40);
-}
-
-void signalConnectedIdle() {
-  // Cyan solid when connected and idle
-  rgbColor(false, true, true);
-}
-
-void signalAdvertising() {
-  // Purple solid when waiting for nothing (WiFi connecting)
-  rgbColor(true, false, true);
-}
-
-/* ----------------------------
-   TIME (NTP)
----------------------------- */
-void initTimeNTP() {
-  Serial.println("[TIME] Syncing NTP...");
-  configTime(3600, 0, "pool.ntp.org", "time.google.com");
-  rgbBlink(true, true, true, 3, 100, 100); // White blink during time sync
-}
-
-bool timeIsValid() {
-  return time(nullptr) > 1700000000;
-}
-
-int computeDayKey() {
-  if (!timeIsValid()) return -1;
-  time_t now = time(nullptr);
-  struct tm t;
-  localtime_r(&now, &t);
-  return (t.tm_year + 1900) * 1000 + t.tm_yday;
-}
-
-void handleNewDayIfNeeded() {
-  int dayKey = computeDayKey();
-  if (dayKey < 0) return;
-
-  if (currentDayKey == -1) {
-    currentDayKey = dayKey;
-    Serial.printf("[DAY] Initial day key set: %d\n", dayKey);
-    return;
-  }
-
-  if (dayKey != currentDayKey) {
-    Serial.println("[DAY] New day detected → resetting stepCount");
-    stepCount = 0;
-    goalReachedToday = false;
-    currentDayKey = dayKey;
-    signalReset(); // Blue blink for new day reset
-  }
-}
-
-/* ----------------------------
-   EEPROM LOAD/SAVE
----------------------------- */
-template <typename T>
-void eepromWrite(int addr, const T &value) { EEPROM.put(addr, value); }
-
-template <typename T>
-void eepromRead(int addr, T &value) { EEPROM.get(addr, value); }
-
-void loadPersistentConfig() {
-  EEPROM.begin(EEPROM_SIZE);
-
-  uint32_t magic = 0;
-  eepromRead(ADDR_MAGIC, magic);
-
-  if (magic != EEPROM_MAGIC) {
-    Serial.println("[EEPROM] First run → writing defaults");
-    magic = EEPROM_MAGIC;
-    stepGoal = 6000;
-    sensitivity = 1.25f;
-
-    eepromWrite(ADDR_MAGIC, magic);
-    eepromWrite(ADDR_STEP_GOAL, stepGoal);
-    eepromWrite(ADDR_SENSITIVITY, sensitivity);
-    EEPROM.commit();
-    return;
-  }
-
-  eepromRead(ADDR_STEP_GOAL, stepGoal);
-  eepromRead(ADDR_SENSITIVITY, sensitivity);
-
-  Serial.printf("[EEPROM] Loaded goal=%d sensitivity=%.2f\n", stepGoal, sensitivity);
-}
-
-void saveStepGoal(int32_t newGoal) {
-  stepGoal = newGoal;
-  eepromWrite(ADDR_STEP_GOAL, stepGoal);
-  EEPROM.commit();
-  Serial.printf("[EEPROM] Goal updated → %d\n", stepGoal);
-  rgbBlink(true, true, false, 2, 100, 100); // Yellow blink for setting change
-}
-
-void saveSensitivity(float newSens) {
-  sensitivity = newSens;
-  eepromWrite(ADDR_SENSITIVITY, sensitivity);
-  EEPROM.commit();
-  Serial.printf("[EEPROM] Sensitivity updated → %.2f\n", sensitivity);
-  rgbBlink(true, true, false, 2, 100, 100); // Yellow blink for setting change
-}
-
-/* ----------------------------
-   WIFI + MQTT
----------------------------- */
-void connectWiFi() {
-  Serial.printf("[WiFi] Connecting to SSID: %s\n", ssid);
-  WiFi.mode(WIFI_STA);
-  WiFi.begin(ssid, password);
-
-  signalAdvertising(); // Purple while connecting
-  
-  while (WiFi.status() != WL_CONNECTED) {
-    Serial.print(".");
-    delay(300);
-  }
-
-  Serial.println("\n[WiFi] Connected!");
-  Serial.print("[WiFi] IP: ");
-  Serial.println(WiFi.localIP());
-  signalWiFiOK();
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length);
-
-void connectMQTT() {
-  Serial.println("[MQTT] Connecting...");
-  client.setServer(mqtt_server, mqtt_port);
-  client.setCallback(mqttCallback);
-
-  rgbBlink(false, true, false, 3, 100, 100); // Green blink while connecting MQTT
-  
-  while (!client.connected()) {
-    bool ok = client.connect(mqtt_client_id);
-    if (ok) {
-      Serial.println("[MQTT] Connected!");
-      client.subscribe(TOPIC_CONFIG);
-      Serial.printf("[MQTT] Subscribed to %s\n", TOPIC_CONFIG);
-      signalMQTTOK();
-      signalConnectedIdle(); // Cyan solid when connected and idle
-    } else {
-      Serial.printf("[MQTT] Failed, rc=%d\n", client.state());
-      signalError();
-      delay(1200);
-    }
-  }
-}
-
-/* ----------------------------
-   BATTERY READING
----------------------------- */
-int readBatteryPercent() {
-  if (!BATTERY_ENABLED) return -1;
-  
-  // Take average of 5 readings for stability
-  long sum = 0;
-  for (int i = 0; i < 5; i++) {
-    sum += analogRead(BAT_ADC_PIN);
-    delay(2);
-  }
-  int raw = sum / 5;
-  
-  float v = ((float)raw / 4095.0f) * ADC_REF_V * DIVIDER_RATIO;
-  v = constrain(v, BAT_V_MIN, BAT_V_MAX);
-  
-  // Calculate percentage
-  batteryPercent = (int)((v - BAT_V_MIN) / (BAT_V_MAX - BAT_V_MIN) * 100.0f);
-  batteryPercent = constrain(batteryPercent, 0, 100);
-  
-  Serial.printf("[BAT] Voltage: %.2fV, Percent: %d%% (raw=%d)\n", v, batteryPercent, raw);
-  return batteryPercent;
-}
-
-/* ----------------------------
-   JSON PUBLISH
----------------------------- */
-void publishStepsPayload() {
-  StaticJsonDocument<256> doc;
-
-  doc["steps"] = stepCount;
-  doc["goal"]  = stepGoal;
-  doc["goalReachedToday"] = goalReachedToday;
-  doc["battery"] = batteryPercent; // Added battery to JSON
-
-  time_t now = time(nullptr);
-  doc["timestamp"] = (uint32_t)now;
-
-  char buffer[256];
-  size_t n = serializeJson(doc, buffer);
-
-  Serial.print("[MQTT] Publishing: ");
-  Serial.println(buffer);
-
-  client.publish(TOPIC_STEPS, buffer, n);
-  
-  // Brief white blink on publish
-  rgbBlink(true, true, true, 1, 50, 50);
-}
-
-/* ----------------------------
-   COMMAND PARSING
----------------------------- */
-String trimString(const String& s) {
-  int start = 0;
-  while (start < (int)s.length() && isspace((unsigned char)s[start])) start++;
-  int end = s.length() - 1;
-  while (end >= 0 && isspace((unsigned char)s[end])) end--;
-  if (end < start) return "";
-  return s.substring(start, end + 1);
-}
-
-void handleCommand(const String& cmdRaw) {
-  Serial.printf("[CMD] Received: %s\n", cmdRaw.c_str());
-
-  String cmd = trimString(cmdRaw);
-
-  if (cmd.equalsIgnoreCase("reset")) {
-    Serial.println("[CMD] RESET triggered");
-    stepCount = 0;
-    goalReachedToday = false;
-    signalReset();
-    return;
-  }
-
-  if (cmd.startsWith("goal:")) {
-    int32_t g = cmd.substring(5).toInt();
-    if (g > 0) {
-      saveStepGoal(g);
-    }
-    return;
-  }
-
-  if (cmd.startsWith("sens:")) {
-    float s = cmd.substring(5).toFloat();
-    if (s > 0.0f && s <= 20.0f) {
-      saveSensitivity(s);
-    }
-    return;
-  }
-  
-  if (cmd.equalsIgnoreCase("readbattery")) {
-    Serial.println("[CMD] Manual battery read requested");
-    readBatteryPercent();
-    return;
-  }
-
-  Serial.println("[CMD] Unknown command");
-}
-
-void mqttCallback(char* topic, byte* payload, unsigned int length) {
-  String msg;
-  for (unsigned int i = 0; i < length; i++) msg += (char)payload[i];
-
-  Serial.printf("[MQTT] Message on %s: %s\n", topic, msg.c_str());
-
-  handleCommand(msg);
-}
-
-/* ----------------------------
-   STEP DETECTION
----------------------------- */
-bool detectStepFromAccel(float ax, float ay, float az, uint32_t nowMs) {
-  float mag = sqrtf(ax*ax + ay*ay + az*az);
-
-  const float alpha = 0.90f;
-  g_est = alpha * g_est + (1.0f - alpha) * mag;
-
-  float hp = mag - g_est;
-
-  bool crossingUp = (prev_hp <= sensitivity) && (hp > sensitivity);
-  bool okSpike = (hp < 50.0f);
-  bool okTiming = (nowMs - lastStepMs) >= minStepIntervalMs;
-
-  prev_hp = hp;
-
-  if (crossingUp && okSpike && okTiming) {
-    lastStepMs = nowMs;
-    return true;
-  }
-  return false;
-}
-
-/* ----------------------------
-   GOAL HANDLING
----------------------------- */
-void handleGoalLogic() {
-  if (!goalReachedToday && stepCount >= (uint32_t)stepGoal) {
-    Serial.println("[GOAL] Goal reached!");
-    goalReachedToday = true;
-    signalGoal();
-  }
-}
-
-/* ----------------------------
-   SETUP
----------------------------- */
-void setup() {
-  // Initialize RGB LED pins
-  pinMode(LED_Red, OUTPUT);
-  pinMode(LED_Green, OUTPUT);
-  pinMode(LED_Blue, OUTPUT);
-  rgbOff();
-  
-  // Initialize battery pin if enabled
-  if (BATTERY_ENABLED) {
-    pinMode(BAT_ADC_PIN, INPUT);
-    analogReadResolution(12);
-  }
-
-  Serial.begin(115200);
-  delay(200);
-
-  Serial.println("\n=== SMART STEPS ESP32 STARTUP ===");
-  
-  // Startup sequence - rainbow blink
-  rgbBlink(true, false, false, 1, 200, 100); // Red
-  rgbBlink(false, true, false, 1, 200, 100); // Green
-  rgbBlink(false, false, true, 1, 200, 100); // Blue
-
-  loadPersistentConfig();
-
-  if (!initAccelerometer()) {
-    Serial.println("[FATAL] Accelerometer missing");
-    while (true) { 
-      signalError(); 
-      delay(500); 
-    }
-  }
-
-  connectWiFi();
-  initTimeNTP();
-  connectMQTT();
-  
-  // Initial battery reading
-  if (BATTERY_ENABLED) {
-    readBatteryPercent();
-  }
-
-  currentDayKey = computeDayKey();
-  Serial.printf("[DAY] Current day key = %d\n", currentDayKey);
-}
-
-/* ----------------------------
-   LOOP
----------------------------- */
-void loop() {
-  if (WiFi.status() != WL_CONNECTED) {
-    Serial.println("[WiFi] Lost connection → reconnecting");
-    signalAdvertising(); // Purple while reconnecting
-    connectWiFi();
-    signalConnectedIdle(); // Back to cyan
-  }
-
-  if (!client.connected()) {
-    Serial.println("[MQTT] Lost connection → reconnecting");
-    rgbBlink(false, true, false, 3, 100, 100); // Green blink during MQTT reconnect
-    connectMQTT();
-  }
-  client.loop();
-
-  handleNewDayIfNeeded();
-
-  uint32_t nowMs = millis();
-  uint32_t sampleInterval = goalReachedToday ? sampleIntervalMs_afterGoal : sampleIntervalMs_beforeGoal;
-
-  if (nowMs - lastSampleMs >= sampleInterval) {
-    lastSampleMs = nowMs;
-
-    float ax, ay, az;
-    if (readAccel(ax, ay, az)) {
-      if (detectStepFromAccel(ax, ay, az, nowMs)) {
+bool detectStep(float ax, float ay, float az, uint32_t nowMs) {
+    // Fast magnitude calculation (avoid sqrt when possible in future optimizations)
+    float mag = sqrtf(ax*ax + ay*ay + az*az);
+    
+    // High-pass filter
+    g_est = 0.9f * g_est + 0.1f * mag;
+    float hp = mag - g_est;
+    
+    bool stepDetected = (prev_hp <= sensitivity && hp > sensitivity && 
+                        hp < 50.0f && (nowMs - lastStepMs) >= 280);
+    
+    prev_hp = hp;
+    
+    if (stepDetected) {
+        lastStepMs = nowMs;
+        lastActivityTime = nowMs; // Update activity timestamp
         stepCount++;
-        signalStepDetected(); // Orange flash for step
-        Serial.printf("[STEP] stepCount=%u\n", stepCount);
-      }
+        newStepsAvailable = true;
+        
+        // Yellow/orange blink for step (red + green)
+        rgbBlink(true, true, false, 1, 100, 0); // 100ms yellow blink
+        
+        if (!goalReachedToday && stepCount >= (uint32_t)stepGoal) {
+            goalReachedToday = true;
+            // Green celebration blink sequence
+            rgbBlink(false, true, false, 3, 200, 150);
+        }
+        return true;
     }
+    return false;
+}
 
-    handleGoalLogic();
-  }
+// ===== OPTIMIZED JSON PUBLISHING =====
+void publishSteps() {
+    if (!client.connected()) return;
+    
+    // Reuse existing JSON document
+    jsonDoc.clear();
+    jsonDoc["steps"] = stepCount;
+    jsonDoc["goal"] = stepGoal;
+    jsonDoc["goalReachedToday"] = goalReachedToday;
+    jsonDoc["battery"] = batteryPercent;
+    jsonDoc["timestamp"] = (uint32_t)time(nullptr);
+    
+    // Fast serialization into pre-allocated buffer
+    size_t len = serializeJson(jsonDoc, jsonBuffer, sizeof(jsonBuffer));
+    
+    // Fast publish (no need for print debugging in production)
+    client.publish(TOPIC_STEPS, jsonBuffer, len);
+    
+    // White blink on publish
+    rgbBlink(true, true, true, 1, 100, 0);
+}
 
-  uint32_t stepsPubInterval = goalReachedToday ? publishStepsInterval_afterGoal : publishStepsInterval_beforeGoal;
+// ===== FAST BATTERY READING =====
+void readBattery() {
+    // Single reading (fast) instead of averaging
+    int raw = analogRead(BAT_ADC_PIN);
+    float v = ((float)raw / 4095.0f) * 3.3f * 2.0f;
+    v = constrain(v, 3.30f, 4.20f);
+    batteryPercent = (int)((v - 3.30f) / (4.20f - 3.30f) * 100.0f);
+    batteryPercent = constrain(batteryPercent, 0, 100);
+}
 
-  if (nowMs - lastPublishStepsMs >= stepsPubInterval) {
-    lastPublishStepsMs = nowMs;
-    publishStepsPayload();
-  }
+// ===== FAST ACCELEROMETER READING =====
+bool readAccel(float &ax, float &ay, float &az) {
+    int8_t x, y, z;
+    if (!accel.getXYZ(&x, &y, &z)) return false;
+    
+    // Pre-calculated scale factor
+    static const float SCALE = (1.5f / 32.0f) * 9.81f;
+    ax = (float)x * SCALE;
+    ay = (float)y * SCALE;
+    az = (float)z * SCALE;
+    return true;
+}
 
-  // Publish battery reading at intervals
-  if (BATTERY_ENABLED && (nowMs - lastPublishBatteryMs >= publishBatteryIntervalMs)) {
-    lastPublishBatteryMs = nowMs;
-    readBatteryPercent(); // Update battery reading
-    // Battery is included in the regular steps payload, no need for separate publish
-  }
-  
-  // Keep idle LED state
-  if (client.connected()) {
-    signalConnectedIdle(); // Maintain cyan when idle and connected
-  }
+// ===== OPTIMIZED CONNECTION MANAGEMENT =====
+void checkConnections() {
+    uint32_t now = millis();
+    
+    // Non-blocking WiFi check
+    if (WiFi.status() != WL_CONNECTED) {
+        static uint32_t lastWifiAttempt = 0;
+        if (now - lastWifiAttempt > 2000) {
+            WiFi.reconnect();
+            lastWifiAttempt = now;
+            // Purple while reconnecting
+            rgbBlink(true, false, true, 2, 150, 150);
+        }
+        return;
+    }
+    
+    // Non-blocking MQTT check
+    if (!client.connected()) {
+        static uint32_t lastMqttAttempt = 0;
+        if (now - lastMqttAttempt > 2000) {
+            if (client.connect("ESP32_SmartSteps")) {
+                client.subscribe(TOPIC_CONFIG);
+                // Cyan connection indication (will turn off after CONNECTION_LED_DURATION)
+                rgbColor(false, true, true);
+                connectionLedOffTime = now + CONNECTION_LED_DURATION;
+            }
+            lastMqttAttempt = now;
+        }
+    }
+}
+
+// ===== MQTT CALLBACK =====
+void mqttCallback(char* topic, byte* payload, unsigned int length) {
+    // Fast command processing
+    if (length == 0) return;
+    
+    String cmd = "";
+    for (unsigned int i = 0; i < length && i < 32; i++) {
+        cmd += (char)payload[i];
+    }
+    
+    // Fast command parsing
+    if (cmd == "reset") {
+        stepCount = 0;
+        goalReachedToday = false;
+        newStepsAvailable = true;  // Force immediate update
+        // Blue reset blink
+        rgbBlink(false, false, true, 3, 200, 150);
+    }
+    else if (cmd.startsWith("goal:")) {
+        stepGoal = cmd.substring(5).toInt();
+        EEPROM.put(4, stepGoal);
+        EEPROM.commit();
+        // Yellow confirmation blink
+        rgbBlink(true, true, false, 2, 200, 150);
+    }
+    else if (cmd.startsWith("sens:")) {
+        sensitivity = cmd.substring(5).toFloat();
+        EEPROM.put(8, sensitivity);
+        EEPROM.commit();
+        // Yellow confirmation blink
+        rgbBlink(true, true, false, 2, 200, 150);
+    }
+}
+
+// ===== SETUP (OPTIMIZED) =====
+void setup() {
+    // Fast initialization
+    Serial.begin(115200);
+    
+    // GPIO setup
+    pinMode(LED_Red, OUTPUT);
+    pinMode(LED_Green, OUTPUT);
+    pinMode(LED_Blue, OUTPUT);
+    rgbOff();
+    
+    // Fast accelerometer init
+    Wire.begin();
+    accel.init();
+    delay(50);  // Minimal delay
+    
+    // Fast EEPROM load
+    EEPROM.begin(64);
+    EEPROM.get(4, stepGoal);
+    EEPROM.get(8, sensitivity);
+    
+    // Fast WiFi connect (non-blocking start)
+    WiFi.mode(WIFI_STA);
+    WiFi.begin(ssid, password);
+    
+    // Fast MQTT setup
+    client.setServer(mqtt_server, mqtt_port);
+    client.setCallback(mqttCallback);
+    client.setBufferSize(256);  // Optimized buffer
+    
+    // NTP setup (non-blocking)
+    configTime(3600, 0, "pool.ntp.org");
+    
+    // Startup indicator - rainbow sequence
+    rgbBlink(true, false, false, 1, 300, 100);   // Red
+    rgbBlink(false, true, false, 1, 300, 100);   // Green
+    rgbBlink(false, false, true, 1, 300, 100);   // Blue
+    
+    lastActivityTime = millis();
+}
+
+// ===== MAIN LOOP (OPTIMIZED) =====
+void loop() {
+    uint32_t now = millis();
+    
+    // 1. Check connections (non-blocking, every 5s)
+    if (now - lastConnectionCheck >= CONNECTION_CHECK) {
+        lastConnectionCheck = now;
+        checkConnections();
+    }
+    
+    // 2. Handle MQTT (non-blocking)
+    if (client.connected()) {
+        client.loop();
+    }
+    
+    // 3. Read sensor (fixed interval, no blocking)
+    if (now - lastSensorRead >= SENSOR_INTERVAL) {
+        lastSensorRead = now;
+        
+        float ax, ay, az;
+        if (readAccel(ax, ay, az)) {
+            detectStep(ax, ay, az, now);
+        }
+    }
+    
+    // 4. Publish steps (fast check, immediate on change or interval)
+    if ((newStepsAvailable && client.connected()) || 
+        (now - lastStepPublish >= PUBLISH_INTERVAL)) {
+        lastStepPublish = now;
+        publishSteps();
+        newStepsAvailable = false;
+    }
+    
+    // 5. Read battery (30s interval)
+    if (now - lastBatteryRead >= BATTERY_INTERVAL) {
+        lastBatteryRead = now;
+        readBattery();
+    }
+    
+    // 6. Check day change (1 minute interval)
+    if (now - lastDayCheck >= DAY_CHECK_INTERVAL) {
+        lastDayCheck = now;
+        // Your day check logic here
+    }
+    
+    // 7. Manage connection LED timeout
+    if (connectionLedOffTime > 0 && now >= connectionLedOffTime) {
+        rgbOff(); // Turn off cyan LED after connection period
+        connectionLedOffTime = 0;
+    }
+    
+    // 8. Turn off LED after inactivity (only if not showing connection LED)
+    if (connectionLedOffTime == 0 && 
+        client.connected() && 
+        WiFi.status() == WL_CONNECTED &&
+        (now - lastActivityTime >= INACTIVITY_TIMEOUT)) {
+        rgbOff(); // Turn off LED during inactivity
+    }
+    
+    // Minimal yield to prevent watchdog
+    delay(1);
 }

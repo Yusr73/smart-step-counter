@@ -25,7 +25,10 @@ const ui = {
     goalInput: document.getElementById("goalInput"),
     sensInput: document.getElementById("sensInput"),
     resetBtn: document.getElementById("resetBtn"),
-    applyBtn: document.getElementById("applyBtn")
+    applyBtn: document.getElementById("applyBtn"),
+    batteryValue: document.getElementById("batteryValue"),
+    batteryStatus: document.getElementById("batteryStatus"),
+    achievementBadge: document.getElementById("achievementBadge")
 };
 
 // -------------------------------
@@ -54,6 +57,9 @@ client.on("reconnect", () => {
 client.on("close", () => {
     ui.status.textContent = "Disconnected";
     ui.status.style.color = "red";
+    ui.achievementBadge.style.display = "none";
+    ui.batteryValue.textContent = "--%";
+    ui.batteryStatus.className = "battery-status";
 });
 
 client.on("error", (err) => {
@@ -106,6 +112,33 @@ function calcPace(steps) {
     if (paceHistory.length < 2) return 0;
 
     return paceHistory[paceHistory.length - 1].steps - paceHistory[0].steps;
+}
+
+// -------------------------------
+// BATTERY STATUS UPDATE
+// -------------------------------
+function updateBatteryStatus(batteryPercent) {
+    ui.batteryValue.textContent = `${batteryPercent}%`;
+    
+    // Set color class based on battery level
+    if (batteryPercent <= 20) {
+        ui.batteryStatus.className = "battery-status low";
+    } else if (batteryPercent <= 50) {
+        ui.batteryStatus.className = "battery-status medium";
+    } else {
+        ui.batteryStatus.className = "battery-status high";
+    }
+}
+
+// -------------------------------
+// GOAL ACHIEVEMENT BADGE
+// -------------------------------
+function updateGoalAchievement(goalReachedToday) {
+    if (goalReachedToday) {
+        ui.achievementBadge.style.display = "block";
+    } else {
+        ui.achievementBadge.style.display = "none";
+    }
 }
 
 // -------------------------------
@@ -167,14 +200,20 @@ function updateWeeklyChart(steps) {
 // HANDLE INCOMING MQTT DATA
 // -------------------------------
 function handleIncoming(data) {
-    const steps = data.steps;
-    const goal = data.goal;
+    const steps = data.steps || 0;
+    const goal = data.goal || 6000;
+    const battery = data.battery || 100; // Default to 100% if not provided
+    const goalReachedToday = data.goalReachedToday || false;
 
-    ui.steps.textContent = steps;
+    ui.steps.textContent = steps.toLocaleString();
 
     ui.calories.textContent = calcCalories(steps);
     ui.distance.textContent = calcDistance(steps) + " km";
     ui.pace.textContent = calcPace(steps);
+
+    // Update battery and goal achievement
+    updateBatteryStatus(battery);
+    updateGoalAchievement(goalReachedToday);
 
     const percent = Math.min(steps / goal, 1);
     drawGoalRing(percent);
@@ -194,3 +233,18 @@ ui.applyBtn.onclick = () => {
     if (goal) sendCommand("goal:" + goal);
     if (sens) sendCommand("sens:" + sens);
 };
+
+// -------------------------------
+// INITIALIZATION
+// -------------------------------
+// Initialize UI states
+document.addEventListener("DOMContentLoaded", () => {
+    // Initialize battery display
+    ui.batteryValue.textContent = "--%";
+    ui.batteryStatus.className = "battery-status";
+    
+    // Hide achievement badge initially
+    if (ui.achievementBadge) {
+        ui.achievementBadge.style.display = "none";
+    }
+});
