@@ -47,13 +47,11 @@ int32_t stepGoal = 6000;
 float sensitivity = 1.25f;
 
 bool goalReachedToday = false;
-int  currentDayKey = -1;
 
 /* ----------------------------
    POWER / SAMPLING CONTROL
 ---------------------------- */
 uint32_t sampleIntervalMs = 50;
-
 
 uint32_t publishStepsInterval_beforeGoal = 5000;
 uint32_t publishStepsInterval_afterGoal  = 20000;
@@ -72,14 +70,15 @@ uint32_t lastStepMs = 0;
 uint32_t minStepIntervalMs = 280;
 
 /* ----------------------------
-   BATTERY (OPTIONAL)
+   BATTERY 
 ---------------------------- */
 const int BAT_ADC_PIN = 34;
-const bool BATTERY_ENABLED = false;
+const bool BATTERY_ENABLED = true;  // Changed to true to enable battery
 const float ADC_REF_V = 3.3f;
 const float DIVIDER_RATIO = 2.0f;
 const float BAT_V_MIN = 3.30f;
 const float BAT_V_MAX = 4.20f;
+int batteryPercent = 100;
 
 /* ----------------------------
    ACCELEROMETER
@@ -235,7 +234,6 @@ void saveSensitivityToEEPROM() {
   SERIAL_PRINTF("[EEPROM] Saved sensitivity: %.2f\n", sensitivity);
 }
 
-
 /* ----------------------------
    STEP DETECTION LOGIC
 ---------------------------- */
@@ -278,12 +276,26 @@ bool detectStep(float ax, float ay, float az, uint32_t nowMs) {
 /* ----------------------------
    BATTERY READING
 ---------------------------- */
-float readBatteryVoltage() {
-  if (!BATTERY_ENABLED) return -1.0f;
-  int raw = analogRead(BAT_ADC_PIN);
+int readBatteryPercent() {
+  if (!BATTERY_ENABLED) return -1;
+  
+  // Take average of 5 readings
+  long sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(BAT_ADC_PIN);
+    delay(2);
+  }
+  int raw = sum / 5;
+  
   float v = ((float)raw / 4095.0f) * ADC_REF_V * DIVIDER_RATIO;
-  SERIAL_PRINTF("[BAT] Voltage: %.2fV (raw=%d)\n", v, raw);
-  return v;
+  v = constrain(v, BAT_V_MIN, BAT_V_MAX);
+  
+  // Calculate percentage
+  batteryPercent = (int)((v - BAT_V_MIN) / (BAT_V_MAX - BAT_V_MIN) * 100.0f);
+  batteryPercent = constrain(batteryPercent, 0, 100);
+  
+  SERIAL_PRINTF("[BAT] Voltage: %.2fV, Percent: %d%% (raw=%d)\n", v, batteryPercent, raw);
+  return batteryPercent;
 }
 
 /* ----------------------------
@@ -294,12 +306,14 @@ float readBatteryVoltage() {
 #define GOAL_RW_CHAR_UUID              "0002abcd-0000-1000-8000-00805f9b34fb"
 #define SENSITIVITY_RW_CHAR_UUID       "0003abcd-0000-1000-8000-00805f9b34fb"
 #define COMMAND_W_CHAR_UUID            "0004abcd-0000-1000-8000-00805f9b34fb"
+#define BATTERY_CHAR_UUID              "0005abcd-0000-1000-8000-00805f9b34fb"
 
 BLEServer *pServer = nullptr;
 BLECharacteristic *pStepsJsonChar = nullptr;
 BLECharacteristic *pGoalChar = nullptr;
 BLECharacteristic *pSensChar = nullptr;
 BLECharacteristic *pCmdChar = nullptr;
+BLECharacteristic *pBatteryChar = nullptr;
 
 bool bleDeviceConnected = false;
 
@@ -398,6 +412,10 @@ class CommandCharCallbacks : public BLECharacteristicCallbacks {
         SERIAL_PRINTF("[CMD] Sensitivity changed to: %.2f\n", sensitivity);
       }
     }
+    else if (cmd == "readbattery") {
+      SERIAL_PRINTLN("[CMD] Manual battery read requested");
+      readBatteryPercent();
+    }
   }
 };
 
@@ -417,7 +435,7 @@ void setupBLE() {
   BLEService *pService = pServer->createService(SMARTSTEPS_SERVICE_UUID);
   SERIAL_PRINTLN("[BLE] Service created");
 
-  // FIX 1: Steps characteristic with READ + NOTIFY
+  // Steps characteristic with READ + NOTIFY
   pStepsJsonChar = pService->createCharacteristic(
       STEPS_JSON_CHAR_UUID,
       BLECharacteristic::PROPERTY_NOTIFY | 
@@ -426,41 +444,56 @@ void setupBLE() {
   pStepsJsonChar->addDescriptor(new BLE2902());
   SERIAL_PRINTLN("[BLE] Steps characteristic created (NOTIFY+READ)");
 
-  // Goal characteristic (already correct)
+  // Goal characteristic
   pGoalChar = pService->createCharacteristic(
       GOAL_RW_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
-  // Sensitivity characteristic (already correct)
+  // Sensitivity characteristic
   pSensChar = pService->createCharacteristic(
       SENSITIVITY_RW_CHAR_UUID,
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
-  // FIX 2: Command characteristic with WRITE + WRITE_NR
+  // Command characteristic with WRITE + WRITE_NR
   pCmdChar = pService->createCharacteristic(
       COMMAND_W_CHAR_UUID,
       BLECharacteristic::PROPERTY_WRITE | 
       BLECharacteristic::PROPERTY_WRITE_NR
   );
 
+  // Battery characteristic
+  pBatteryChar = pService->createCharacteristic(
+      BATTERY_CHAR_UUID,
+      BLECharacteristic::PROPERTY_READ | 
+      BLECharacteristic::PROPERTY_NOTIFY
+  );
+  pBatteryChar->addDescriptor(new BLE2902());
+  SERIAL_PRINTLN("[BLE] Battery characteristic created");
+
   pGoalChar->setCallbacks(new GoalCharCallbacks());
   pSensChar->setCallbacks(new SensCharCallbacks());
   pCmdChar->setCallbacks(new CommandCharCallbacks());
 
   // Set initial values for ALL characteristics
-  char bufG[16], bufS[16];
+  char bufG[16], bufS[16], batBuf[16];
   snprintf(bufG, sizeof(bufG), "%ld", (long)stepGoal);
   snprintf(bufS, sizeof(bufS), "%.3f", sensitivity);
+  snprintf(batBuf, sizeof(batBuf), "%d%%", batteryPercent);
+  
   pGoalChar->setValue(bufG);
   pSensChar->setValue(bufS);
+  pBatteryChar->setValue(batBuf);
   
-  // FIX 3: Set initial value for steps characteristic
-  char stepsBuf[64];
+  // Set initial value for steps characteristic (prevent overflow with larger buffer)
+  char stepsBuf[256];  // Increased from 128 to prevent overflow
   snprintf(stepsBuf, sizeof(stepsBuf), 
-           "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":false,\"timestamp\":0}",
-           stepCount, stepGoal);
+           "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"battery\":%d,\"timestamp\":%lu}",
+           stepCount, stepGoal, 
+           goalReachedToday ? "true" : "false",
+           batteryPercent,
+           (unsigned long)(millis() / 1000UL));
   pStepsJsonChar->setValue(stepsBuf);
   
   // Also set an empty value for command characteristic
@@ -478,8 +511,8 @@ void setupBLE() {
 
   SERIAL_PRINTLN("[BLE] Advertising started");
   signalAdvertising();
-   debugBLECharacteristics();
 }
+
 /* ----------------------------
    STEPS JSON PUBLISH
 ---------------------------- */
@@ -488,14 +521,15 @@ void publishStepsJson(uint32_t nowMs) {
     return;
   }
 
-  static char jsonBuf[128];
+  static char jsonBuf[256];  // Increased to prevent overflow
   snprintf(
       jsonBuf,
       sizeof(jsonBuf),
-      "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"timestamp\":%lu}",
+      "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"battery\":%d,\"timestamp\":%lu}",
       (unsigned long)stepCount,
       (long)stepGoal,
       goalReachedToday ? "true" : "false",
+      batteryPercent,
       (unsigned long)(nowMs / 1000UL)
   );
 
@@ -508,51 +542,25 @@ void publishStepsJson(uint32_t nowMs) {
 /* ----------------------------
    BATTERY PUBLISH
 ---------------------------- */
-void publishBatteryIfNeeded(uint32_t nowMs) {
+void publishBattery(uint32_t nowMs) {
   if (!BATTERY_ENABLED) return;
   if (!bleDeviceConnected) return;
 
+  readBatteryPercent();  // Update battery reading
+  
+  char batBuf[16];
+  snprintf(batBuf, sizeof(batBuf), "%d%%", batteryPercent);
+  pBatteryChar->setValue(batBuf);
+  pBatteryChar->notify();
+  
+  SERIAL_PRINTF("[BLE] Battery published: %s\n", batBuf);
+}
+
+void publishBatteryIfNeeded(uint32_t nowMs) {
   if (nowMs - lastPublishBatteryMs >= publishBatteryIntervalMs) {
     lastPublishBatteryMs = nowMs;
-    float v = readBatteryVoltage();
-    // Battery voltage could be sent via BLE if needed
+    publishBattery(nowMs);
   }
-}
-void debugBLECharacteristics() {
-    SERIAL_PRINTLN("\n=== ESP32 BLE DEBUG ===");
-    
-    // Just print what we know from our own pointers
-    SERIAL_PRINTLN("1. Steps Characteristic:");
-    if (pStepsJsonChar) {
-        uint16_t props = pStepsJsonChar->getProperties();
-        SERIAL_PRINTF("   Properties: 0x%04X\n", props);
-        SERIAL_PRINT("   Decoded: ");
-        if (props & 0x02) SERIAL_PRINT("READ ");
-        if (props & 0x04) SERIAL_PRINT("WRITE_NR ");
-        if (props & 0x08) SERIAL_PRINT("WRITE ");
-        if (props & 0x10) SERIAL_PRINT("NOTIFY ");
-        if (props & 0x20) SERIAL_PRINT("INDICATE ");
-        SERIAL_PRINTLN();
-    } else {
-        SERIAL_PRINTLN("   ERROR: NULL pointer!");
-    }
-    
-    SERIAL_PRINTLN("\n2. Command Characteristic:");
-    if (pCmdChar) {
-        uint16_t props = pCmdChar->getProperties();
-        SERIAL_PRINTF("   Properties: 0x%04X\n", props);
-        SERIAL_PRINT("   Decoded: ");
-        if (props & 0x02) SERIAL_PRINT("READ ");
-        if (props & 0x04) SERIAL_PRINT("WRITE_NR ");
-        if (props & 0x08) SERIAL_PRINT("WRITE ");
-        if (props & 0x10) SERIAL_PRINT("NOTIFY ");
-        if (props & 0x20) SERIAL_PRINT("INDICATE ");
-        SERIAL_PRINTLN();
-    } else {
-        SERIAL_PRINTLN("   ERROR: NULL pointer!");
-    }
-    
-    SERIAL_PRINTLN("========================\n");
 }
 
 /* ----------------------------
@@ -579,6 +587,13 @@ void setup() {
   // Load configuration
   loadConfigFromEEPROM();
   
+  // Initialize battery pin if enabled
+  if (BATTERY_ENABLED) {
+    pinMode(BAT_ADC_PIN, INPUT);
+    analogReadResolution(12);
+    SERIAL_PRINTLN("Battery monitoring enabled");
+  }
+  
   // Initialize accelerometer
   SERIAL_PRINTLN("Initializing accelerometer...");
   if (!initAccelerometer()) {
@@ -589,9 +604,6 @@ void setup() {
       SERIAL_PRINTLN("Stuck in error state - check accelerometer wiring");
     }
   }
-  
-  // Initialize day counter (simple version)
-  currentDayKey = -1;  // Placeholder - no real time tracking
   
   // Initialize BLE
   SERIAL_PRINTLN("Initializing BLE...");
@@ -605,6 +617,7 @@ void setup() {
   SERIAL_PRINTLN("\n=== SETUP COMPLETE ===");
   SERIAL_PRINTLN("System ready. Waiting for BLE connection...\n");
 }
+
 /* ----------------------------
    MAIN LOOP
 ---------------------------- */
@@ -615,18 +628,12 @@ void loop() {
   // Heartbeat every 10 seconds
   if (nowMs - lastHeartbeatMs >= 10000) {
     lastHeartbeatMs = nowMs;
-    SERIAL_PRINTF("[HEARTBEAT] Steps: %lu, Goal: %ld, Reached: %d, Connected: %d, Free Heap: %d\n", 
-                  stepCount, stepGoal, goalReachedToday, bleDeviceConnected, ESP.getFreeHeap());
+    SERIAL_PRINTF("[HEARTBEAT] Steps: %lu, Goal: %ld, Reached: %d, Connected: %d, Battery: %d%%, Free Heap: %d\n", 
+                  stepCount, stepGoal, goalReachedToday, bleDeviceConnected, batteryPercent, ESP.getFreeHeap());
   }
   
- 
-  
-  // Determine sampling rate
-  uint32_t sampleInterval =  sampleIntervalMs;
-
-  
   // Sample accelerometer
-  if (nowMs - lastSampleMs >= sampleInterval) {
+  if (nowMs - lastSampleMs >= sampleIntervalMs) {
     lastSampleMs = nowMs;
     float ax, ay, az;
     if (readAccel(ax, ay, az)) {

@@ -1,5 +1,10 @@
 /*
   ESP32 Smart Step Counter (Wi-Fi / MQTT, web dashboard mode)
+  
+  Added Features:
+  - RGB LED status indicators (common-anode)
+  - Battery monitoring and publishing
+  - All existing MQTT/NTP/day tracking preserved
 
   MQTT:
     - Publish: smartsteps/steps
@@ -9,6 +14,7 @@
     - "reset"       -> stepCount = 0
     - "goal:8000"   -> store stepGoal (EEPROM) + update RAM
     - "sens:1.35"   -> store sensitivity (EEPROM) + update RAM
+    - "readbattery" -> force battery reading
 
   Features:
     - Step detection (simple peak detection on high-pass filtered accel magnitude)
@@ -16,8 +22,9 @@
     - stepGoal + sensitivity in EEPROM
     - NTP-based new day detection -> reset stepCount
     - Goal reached event only once per day
-    - LED signaling for WiFi/MQTT/error/reset/goal
+    - RGB LED signaling for status
     - Sampling & publish rate reduced after reaching goal
+    - Battery monitoring and reporting
 */
 
 #include <WiFi.h>
@@ -52,9 +59,11 @@ WiFiClient espClient;
 PubSubClient client(espClient);
 
 /* ----------------------------
-   LED / STATUS
+   RGB LED (COMMON-ANODE)
 ---------------------------- */
-const int LED_PIN = 2;
+#define LED_Red   16
+#define LED_Green 13
+#define LED_Blue  12
 
 /* ----------------------------
    EEPROM LAYOUT
@@ -98,14 +107,15 @@ uint32_t lastStepMs = 0;
 uint32_t minStepIntervalMs = 280;
 
 /* ----------------------------
-   BATTERY (OPTIONAL)
+   BATTERY MONITORING
 ---------------------------- */
 const int BAT_ADC_PIN = 34;
-const bool BATTERY_ENABLED = false;
+const bool BATTERY_ENABLED = true;
 const float ADC_REF_V = 3.3f;
 const float DIVIDER_RATIO = 2.0f;
 const float BAT_V_MIN = 3.30f;
 const float BAT_V_MAX = 4.20f;
+int batteryPercent = 100;
 
 /* ----------------------------
    ACCELEROMETER
@@ -140,22 +150,71 @@ bool readAccel(float &ax, float &ay, float &az) {
 }
 
 /* ----------------------------
-   LED BLINK HELPERS
+   RGB LED HELPERS
 ---------------------------- */
-void blink(int times, int onMs=120, int offMs=120) {
+void rgbOff() {
+  digitalWrite(LED_Red,   HIGH);
+  digitalWrite(LED_Green, HIGH);
+  digitalWrite(LED_Blue,  HIGH);
+}
+
+void rgbColor(bool r, bool g, bool b) {
+  digitalWrite(LED_Red,   r ? LOW : HIGH);
+  digitalWrite(LED_Green, g ? LOW : HIGH);
+  digitalWrite(LED_Blue,  b ? LOW : HIGH);
+}
+
+void rgbBlink(bool r, bool g, bool b, int times, int onMs=120, int offMs=120) {
   for (int i = 0; i < times; i++) {
-    digitalWrite(LED_PIN, HIGH);
+    rgbColor(r, g, b);
     delay(onMs);
-    digitalWrite(LED_PIN, LOW);
+    rgbOff();
     delay(offMs);
   }
 }
 
-void signalWiFiOK()  { blink(2, 80, 120); Serial.println("[LED] WiFi OK"); }
-void signalMQTTOK()  { blink(3, 70, 90);  Serial.println("[LED] MQTT OK"); }
-void signalError()   { blink(1, 600, 250); Serial.println("[LED] ERROR"); }
-void signalReset()   { blink(1, 150, 150); Serial.println("[LED] RESET"); }
-void signalGoal()    { blink(5, 90, 90);   Serial.println("[LED] GOAL"); }
+/* ----------------------------
+   STATUS SIGNALS (RGB LED)
+---------------------------- */
+void signalWiFiOK() {
+  Serial.println("[LED] WiFi OK (Cyan blink)");
+  rgbBlink(false, true, true, 2, 80, 120);
+}
+
+void signalMQTTOK() {
+  Serial.println("[LED] MQTT OK (Purple blink)");
+  rgbBlink(true, false, true, 3, 70, 90);
+}
+
+void signalError() {
+  Serial.println("[LED] ERROR (Red blink)");
+  rgbBlink(true, false, false, 1, 600, 250);
+}
+
+void signalReset() {
+  Serial.println("[LED] RESET (Blue blink)");
+  rgbBlink(false, false, true, 1, 150, 150);
+}
+
+void signalGoal() {
+  Serial.println("[LED] GOAL (Green blink)");
+  rgbBlink(false, true, false, 5, 90, 90);
+}
+
+void signalStepDetected() {
+  // Brief orange flash for each step
+  rgbBlink(true, true, false, 1, 40, 40);
+}
+
+void signalConnectedIdle() {
+  // Cyan solid when connected and idle
+  rgbColor(false, true, true);
+}
+
+void signalAdvertising() {
+  // Purple solid when waiting for nothing (WiFi connecting)
+  rgbColor(true, false, true);
+}
 
 /* ----------------------------
    TIME (NTP)
@@ -163,6 +222,7 @@ void signalGoal()    { blink(5, 90, 90);   Serial.println("[LED] GOAL"); }
 void initTimeNTP() {
   Serial.println("[TIME] Syncing NTP...");
   configTime(3600, 0, "pool.ntp.org", "time.google.com");
+  rgbBlink(true, true, true, 3, 100, 100); // White blink during time sync
 }
 
 bool timeIsValid() {
@@ -192,6 +252,7 @@ void handleNewDayIfNeeded() {
     stepCount = 0;
     goalReachedToday = false;
     currentDayKey = dayKey;
+    signalReset(); // Blue blink for new day reset
   }
 }
 
@@ -234,6 +295,7 @@ void saveStepGoal(int32_t newGoal) {
   eepromWrite(ADDR_STEP_GOAL, stepGoal);
   EEPROM.commit();
   Serial.printf("[EEPROM] Goal updated → %d\n", stepGoal);
+  rgbBlink(true, true, false, 2, 100, 100); // Yellow blink for setting change
 }
 
 void saveSensitivity(float newSens) {
@@ -241,6 +303,7 @@ void saveSensitivity(float newSens) {
   eepromWrite(ADDR_SENSITIVITY, sensitivity);
   EEPROM.commit();
   Serial.printf("[EEPROM] Sensitivity updated → %.2f\n", sensitivity);
+  rgbBlink(true, true, false, 2, 100, 100); // Yellow blink for setting change
 }
 
 /* ----------------------------
@@ -251,6 +314,8 @@ void connectWiFi() {
   WiFi.mode(WIFI_STA);
   WiFi.begin(ssid, password);
 
+  signalAdvertising(); // Purple while connecting
+  
   while (WiFi.status() != WL_CONNECTED) {
     Serial.print(".");
     delay(300);
@@ -269,6 +334,8 @@ void connectMQTT() {
   client.setServer(mqtt_server, mqtt_port);
   client.setCallback(mqttCallback);
 
+  rgbBlink(false, true, false, 3, 100, 100); // Green blink while connecting MQTT
+  
   while (!client.connected()) {
     bool ok = client.connect(mqtt_client_id);
     if (ok) {
@@ -276,12 +343,38 @@ void connectMQTT() {
       client.subscribe(TOPIC_CONFIG);
       Serial.printf("[MQTT] Subscribed to %s\n", TOPIC_CONFIG);
       signalMQTTOK();
+      signalConnectedIdle(); // Cyan solid when connected and idle
     } else {
       Serial.printf("[MQTT] Failed, rc=%d\n", client.state());
       signalError();
       delay(1200);
     }
   }
+}
+
+/* ----------------------------
+   BATTERY READING
+---------------------------- */
+int readBatteryPercent() {
+  if (!BATTERY_ENABLED) return -1;
+  
+  // Take average of 5 readings for stability
+  long sum = 0;
+  for (int i = 0; i < 5; i++) {
+    sum += analogRead(BAT_ADC_PIN);
+    delay(2);
+  }
+  int raw = sum / 5;
+  
+  float v = ((float)raw / 4095.0f) * ADC_REF_V * DIVIDER_RATIO;
+  v = constrain(v, BAT_V_MIN, BAT_V_MAX);
+  
+  // Calculate percentage
+  batteryPercent = (int)((v - BAT_V_MIN) / (BAT_V_MAX - BAT_V_MIN) * 100.0f);
+  batteryPercent = constrain(batteryPercent, 0, 100);
+  
+  Serial.printf("[BAT] Voltage: %.2fV, Percent: %d%% (raw=%d)\n", v, batteryPercent, raw);
+  return batteryPercent;
 }
 
 /* ----------------------------
@@ -293,6 +386,7 @@ void publishStepsPayload() {
   doc["steps"] = stepCount;
   doc["goal"]  = stepGoal;
   doc["goalReachedToday"] = goalReachedToday;
+  doc["battery"] = batteryPercent; // Added battery to JSON
 
   time_t now = time(nullptr);
   doc["timestamp"] = (uint32_t)now;
@@ -304,6 +398,9 @@ void publishStepsPayload() {
   Serial.println(buffer);
 
   client.publish(TOPIC_STEPS, buffer, n);
+  
+  // Brief white blink on publish
+  rgbBlink(true, true, true, 1, 50, 50);
 }
 
 /* ----------------------------
@@ -333,13 +430,23 @@ void handleCommand(const String& cmdRaw) {
 
   if (cmd.startsWith("goal:")) {
     int32_t g = cmd.substring(5).toInt();
-    saveStepGoal(g);
+    if (g > 0) {
+      saveStepGoal(g);
+    }
     return;
   }
 
   if (cmd.startsWith("sens:")) {
     float s = cmd.substring(5).toFloat();
-    saveSensitivity(s);
+    if (s > 0.0f && s <= 20.0f) {
+      saveSensitivity(s);
+    }
+    return;
+  }
+  
+  if (cmd.equalsIgnoreCase("readbattery")) {
+    Serial.println("[CMD] Manual battery read requested");
+    readBatteryPercent();
     return;
   }
 
@@ -373,8 +480,6 @@ bool detectStepFromAccel(float ax, float ay, float az, uint32_t nowMs) {
   prev_hp = hp;
 
   if (crossingUp && okSpike && okTiming) {
-    Serial.printf("[STEP] Detected | hp=%.2f | ax=%.2f ay=%.2f az=%.2f\n",
-                  hp, ax, ay, az);
     lastStepMs = nowMs;
     return true;
   }
@@ -396,24 +501,46 @@ void handleGoalLogic() {
    SETUP
 ---------------------------- */
 void setup() {
-  pinMode(LED_PIN, OUTPUT);
-  digitalWrite(LED_PIN, LOW);
+  // Initialize RGB LED pins
+  pinMode(LED_Red, OUTPUT);
+  pinMode(LED_Green, OUTPUT);
+  pinMode(LED_Blue, OUTPUT);
+  rgbOff();
+  
+  // Initialize battery pin if enabled
+  if (BATTERY_ENABLED) {
+    pinMode(BAT_ADC_PIN, INPUT);
+    analogReadResolution(12);
+  }
 
   Serial.begin(115200);
   delay(200);
 
   Serial.println("\n=== SMART STEPS ESP32 STARTUP ===");
+  
+  // Startup sequence - rainbow blink
+  rgbBlink(true, false, false, 1, 200, 100); // Red
+  rgbBlink(false, true, false, 1, 200, 100); // Green
+  rgbBlink(false, false, true, 1, 200, 100); // Blue
 
   loadPersistentConfig();
 
   if (!initAccelerometer()) {
     Serial.println("[FATAL] Accelerometer missing");
-    while (true) { signalError(); delay(500); }
+    while (true) { 
+      signalError(); 
+      delay(500); 
+    }
   }
 
   connectWiFi();
   initTimeNTP();
   connectMQTT();
+  
+  // Initial battery reading
+  if (BATTERY_ENABLED) {
+    readBatteryPercent();
+  }
 
   currentDayKey = computeDayKey();
   Serial.printf("[DAY] Current day key = %d\n", currentDayKey);
@@ -425,11 +552,14 @@ void setup() {
 void loop() {
   if (WiFi.status() != WL_CONNECTED) {
     Serial.println("[WiFi] Lost connection → reconnecting");
+    signalAdvertising(); // Purple while reconnecting
     connectWiFi();
+    signalConnectedIdle(); // Back to cyan
   }
 
   if (!client.connected()) {
     Serial.println("[MQTT] Lost connection → reconnecting");
+    rgbBlink(false, true, false, 3, 100, 100); // Green blink during MQTT reconnect
     connectMQTT();
   }
   client.loop();
@@ -446,6 +576,7 @@ void loop() {
     if (readAccel(ax, ay, az)) {
       if (detectStepFromAccel(ax, ay, az, nowMs)) {
         stepCount++;
+        signalStepDetected(); // Orange flash for step
         Serial.printf("[STEP] stepCount=%u\n", stepCount);
       }
     }
@@ -460,8 +591,15 @@ void loop() {
     publishStepsPayload();
   }
 
+  // Publish battery reading at intervals
   if (BATTERY_ENABLED && (nowMs - lastPublishBatteryMs >= publishBatteryIntervalMs)) {
     lastPublishBatteryMs = nowMs;
-    publishStepsPayload();
+    readBatteryPercent(); // Update battery reading
+    // Battery is included in the regular steps payload, no need for separate publish
+  }
+  
+  // Keep idle LED state
+  if (client.connected()) {
+    signalConnectedIdle(); // Maintain cyan when idle and connected
   }
 }
