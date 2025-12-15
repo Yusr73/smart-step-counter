@@ -121,8 +121,14 @@ class MainActivity : AppCompatActivity(), BleManager.Listener {
 
     // Convert SeekBar 0–10 → sensitivity 1.0–2.0
     private fun valueToSensitivity(v: Int): Float {
-        return 0.5f + (v / 40f)   // 0 → 0.5, 100 → 3.0
+        val minThreshold = 5.0f    // more sensitive (detects small movements)
+        val maxThreshold = 25.0f   // less sensitive (needs strong movement)
+
+        val t = 1.0f - (v / 100f)  // invert slider
+
+        return minThreshold + t * (maxThreshold - minThreshold)
     }
+
 
 
     // ===== BLE PERMISSIONS =====
