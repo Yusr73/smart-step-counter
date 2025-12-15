@@ -47,6 +47,7 @@ int32_t stepGoal = 6000;
 float sensitivity = 1.25f;
 
 bool goalReachedToday = false;
+bool bleDeviceConnected = false;  // MOVED HERE: Declared before detectStep() uses it
 
 /* ----------------------------
    POWER / SAMPLING CONTROL
@@ -235,7 +236,7 @@ void saveSensitivityToEEPROM() {
 }
 
 /* ----------------------------
-   STEP DETECTION LOGIC
+   STEP DETECTION LOGIC - MODIFIED
 ---------------------------- */
 bool detectStep(float ax, float ay, float az, uint32_t nowMs) {
   const float mag = sqrtf(ax * ax + ay * ay + az * az);
@@ -260,10 +261,20 @@ bool detectStep(float ax, float ay, float az, uint32_t nowMs) {
         
         signalStepDetected();
 
+        // ✅ CRITICAL CHANGE: Publish JSON immediately on step detection BEFORE goal reached
+        if (!goalReachedToday && bleDeviceConnected) {
+          publishStepsJson(nowMs);
+          SERIAL_PRINTF("[STEP] Immediate publish after step: %lu\n", stepCount);
+        }
+
         if (!goalReachedToday && stepCount >= (uint32_t)stepGoal) {
           goalReachedToday = true;
           SERIAL_PRINTLN("[STEP] GOAL REACHED!");
           signalGoal();
+          // Also publish immediately when goal is reached
+          if (bleDeviceConnected) {
+            publishStepsJson(nowMs);
+          }
         }
       }
     }
@@ -314,8 +325,6 @@ BLECharacteristic *pGoalChar = nullptr;
 BLECharacteristic *pSensChar = nullptr;
 BLECharacteristic *pCmdChar = nullptr;
 BLECharacteristic *pBatteryChar = nullptr;
-
-bool bleDeviceConnected = false;
 
 /* ----------------------------
    BLE CALLBACKS
@@ -456,7 +465,7 @@ void setupBLE() {
       BLECharacteristic::PROPERTY_READ | BLECharacteristic::PROPERTY_WRITE
   );
 
-  // Command characteristic with WRITE + WRITE_NR
+  // Command characteristic
   pCmdChar = pService->createCharacteristic(
       COMMAND_W_CHAR_UUID,
       BLECharacteristic::PROPERTY_WRITE | 
@@ -476,18 +485,18 @@ void setupBLE() {
   pSensChar->setCallbacks(new SensCharCallbacks());
   pCmdChar->setCallbacks(new CommandCharCallbacks());
 
-  // Set initial values for ALL characteristics
+  // Set initial values
   char bufG[16], bufS[16], batBuf[16];
   snprintf(bufG, sizeof(bufG), "%ld", (long)stepGoal);
   snprintf(bufS, sizeof(bufS), "%.3f", sensitivity);
   snprintf(batBuf, sizeof(batBuf), "%d%%", batteryPercent);
-  
+
   pGoalChar->setValue(bufG);
   pSensChar->setValue(bufS);
   pBatteryChar->setValue(batBuf);
-  
-  // Set initial value for steps characteristic (prevent overflow with larger buffer)
-  char stepsBuf[256];  // Increased from 128 to prevent overflow
+
+  // Initial JSON
+  char stepsBuf[256];
   snprintf(stepsBuf, sizeof(stepsBuf), 
            "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"battery\":%d,\"timestamp\":%lu}",
            stepCount, stepGoal, 
@@ -495,8 +504,8 @@ void setupBLE() {
            batteryPercent,
            (unsigned long)(millis() / 1000UL));
   pStepsJsonChar->setValue(stepsBuf);
-  
-  // Also set an empty value for command characteristic
+
+  // Empty command characteristic
   pCmdChar->setValue("");
 
   pService->start();
@@ -511,33 +520,47 @@ void setupBLE() {
 
   SERIAL_PRINTLN("[BLE] Advertising started");
   signalAdvertising();
+
+  // ✅ SAFE PLACE TO SEND FIRST NOTIFY
+  pStepsJsonChar->notify();
 }
 
+
 /* ----------------------------
-   STEPS JSON PUBLISH
+   STEPS JSON PUBLISH (COMPACT + REACHED FLAG)
 ---------------------------- */
 void publishStepsJson(uint32_t nowMs) {
   if (!bleDeviceConnected) {
     return;
   }
 
-  static char jsonBuf[256];  // Increased to prevent overflow
+  // ✅ FIX: Read battery percentage before including it in JSON
+  if (BATTERY_ENABLED) {
+    readBatteryPercent();
+  }
+
+  static char jsonBuf[64];
+
+  int reached = (stepCount >= stepGoal) ? 1 : 0;
+
+  // ✅ FIX: Use full battery percentage instead of dividing by 10
   snprintf(
-      jsonBuf,
-      sizeof(jsonBuf),
-      "{\"steps\":%lu,\"goal\":%ld,\"goalReachedToday\":%s,\"battery\":%d,\"timestamp\":%lu}",
-      (unsigned long)stepCount,
-      (long)stepGoal,
-      goalReachedToday ? "true" : "false",
-      batteryPercent,
-      (unsigned long)(nowMs / 1000UL)
-  );
+    jsonBuf,
+    sizeof(jsonBuf),
+    "{s:%lu,g:%ld,b:%d,r:%d}",
+    (unsigned long)stepCount,
+    (long)stepGoal,
+    batteryPercent,  // ✅ FIX: Changed from batteryPercent / 10 to batteryPercent
+    reached
+);
 
   SERIAL_PRINTF("[BLE] Publishing JSON: %s\n", jsonBuf);
-  
+
   pStepsJsonChar->setValue((uint8_t *)jsonBuf, strlen(jsonBuf));
   pStepsJsonChar->notify();
 }
+
+
 
 /* ----------------------------
    BATTERY PUBLISH
@@ -619,7 +642,7 @@ void setup() {
 }
 
 /* ----------------------------
-   MAIN LOOP
+   MAIN LOOP - MODIFIED
 ---------------------------- */
 void loop() {
   static uint32_t lastHeartbeatMs = 0;
@@ -643,13 +666,13 @@ void loop() {
     }
   }
   
-  // Publish steps via BLE
-  uint32_t publishInterval = goalReachedToday ? publishStepsInterval_afterGoal
-                                              : publishStepsInterval_beforeGoal;
-  
-  if (nowMs - lastPublishStepsMs >= publishInterval) {
-    lastPublishStepsMs = nowMs;
-    publishStepsJson(nowMs);
+  // Publish steps via BLE - ONLY when goal is reached (lower rate)
+  if (goalReachedToday) {
+    // ✅ Only periodic publishing AFTER goal reached
+    if (nowMs - lastPublishStepsMs >= publishStepsInterval_afterGoal) {
+      lastPublishStepsMs = nowMs;
+      publishStepsJson(nowMs);
+    }
   }
   
   // Handle battery monitoring

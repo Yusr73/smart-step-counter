@@ -1,0 +1,266 @@
+<?xml version="1.0" encoding="utf-8"?>
+<ScrollView xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@drawable/bg_light_gradient"
+    android:padding="20dp">
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:orientation="vertical">
+
+        <!-- Connect Button -->
+        <Button
+            android:id="@+id/connectButton"
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:text="Connect to SmartSteps"
+            android:textStyle="bold"
+            android:textColor="#FFFFFF"
+            android:padding="16dp"
+            android:background="@drawable/btn_blue_gradient"
+            android:elevation="10dp"
+            android:layout_marginBottom="24dp" />
+
+        <!-- Title -->
+        <TextView
+            android:id="@+id/titleText"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="SmartSteps Dashboard"
+            android:textSize="28sp"
+            android:textStyle="bold"
+            android:textColor="#003366"
+            android:paddingBottom="20dp" />
+
+        <!-- Steps Ring + Icon + Goal Ring -->
+        <FrameLayout
+            android:layout_width="260dp"
+            android:layout_height="260dp"
+            android:layout_gravity="center"
+            android:padding="20dp"
+            android:background="@drawable/card_glass"
+            android:elevation="12dp"
+            android:layout_marginBottom="24dp">
+
+            <!-- Goal Ring -->
+            <com.example.smartsteps.GoalRingView
+                android:id="@+id/goalRingView"
+                android:layout_width="match_parent"
+                android:layout_height="match_parent" />
+
+            <!-- Steps Icon + Text -->
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="vertical"
+                android:gravity="center"
+                android:layout_gravity="center">
+
+                <ImageView
+                    android:id="@+id/stepsIcon"
+                    android:layout_width="54dp"
+                    android:layout_height="54dp"
+                    android:src="@drawable/steps_icon"
+                    android:tint="#7FCBFF"
+                    android:layout_marginBottom="12dp" />
+
+                <TextView
+                    android:id="@+id/stepsText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="0 steps"
+                    android:textSize="24sp"
+                    android:textStyle="bold"
+                    android:textColor="#003366" />
+
+            </LinearLayout>
+
+            <!-- Achievement Badge -->
+            <ImageView
+                android:id="@+id/achievementBadge"
+                android:layout_width="60dp"
+                android:layout_height="60dp"
+                android:src="@drawable/achievement_badge"
+                android:layout_gravity="top|end"
+                android:layout_margin="10dp"
+                android:visibility="gone" />
+
+        </FrameLayout>
+
+        <!-- Battery Status -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/card_glass"
+            android:padding="18dp"
+            android:elevation="12dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Battery Status"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:textColor="#003366"
+                android:paddingBottom="12dp" />
+
+            <LinearLayout
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:orientation="horizontal"
+                android:gravity="center_vertical">
+
+                <ImageView
+                    android:id="@+id/batteryIcon"
+                    android:layout_width="40dp"
+                    android:layout_height="40dp"
+                    android:src="@drawable/battery_icon"
+                    android:layout_marginEnd="12dp" />
+
+                <TextView
+                    android:id="@+id/batteryText"
+                    android:layout_width="wrap_content"
+                    android:layout_height="wrap_content"
+                    android:text="Battery: --%"
+                    android:textSize="18sp"
+                    android:textColor="#007BFF" />
+
+            </LinearLayout>
+
+        </LinearLayout>
+
+        <!-- Stats Section -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/card_glass"
+            android:padding="18dp"
+            android:elevation="12dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Daily Stats"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:textColor="#003366"
+                android:paddingBottom="12dp" />
+
+            <TextView
+                android:id="@+id/distanceText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Distance: 0.00 km"
+                android:textSize="16sp"
+                android:textColor="#005599"
+                android:paddingBottom="8dp" />
+
+            <TextView
+                android:id="@+id/caloriesText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Calories: 0 kcal"
+                android:textSize="16sp"
+                android:textColor="#005599"
+                android:paddingBottom="8dp" />
+
+            <TextView
+                android:id="@+id/activeTimeText"
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Pace: 0 spm"
+                android:textSize="16sp"
+                android:textColor="#005599"
+                android:paddingBottom="8dp" />
+
+        </LinearLayout>
+
+        <!-- Settings -->
+        <LinearLayout
+            android:layout_width="match_parent"
+            android:layout_height="wrap_content"
+            android:orientation="vertical"
+            android:background="@drawable/card_glass"
+            android:padding="18dp"
+            android:elevation="12dp"
+            android:layout_marginBottom="20dp">
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Settings"
+                android:textSize="20sp"
+                android:textStyle="bold"
+                android:textColor="#003366"
+                android:paddingBottom="12dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Daily Step Goal"
+                android:textColor="#003366"
+                android:paddingBottom="4dp" />
+
+            <EditText
+                android:id="@+id/goalInput"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:inputType="number"
+                android:hint="Enter goal (e.g., 8000)"
+                android:textColor="#003366"
+                android:textColorHint="#6699CC"
+                android:background="#FFFFFF"
+                android:padding="12dp"
+                android:layout_marginBottom="16dp" />
+
+            <TextView
+                android:layout_width="wrap_content"
+                android:layout_height="wrap_content"
+                android:text="Sensitivity"
+                android:textColor="#003366"
+                android:paddingBottom="4dp" />
+
+            <SeekBar
+                android:id="@+id/sensitivitySeek"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:max="100"
+                android:progress="5"
+                android:progressTint="#007BFF"
+                android:thumbTint="#007BFF" />
+            <Button
+                android:id="@+id/applyBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Apply Settings"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_blue_gradient"
+                android:padding="14dp"
+                android:layout_marginTop="16dp"
+                android:layout_marginBottom="10dp"
+                android:elevation="8dp" />
+
+            <Button
+                android:id="@+id/resetBtn"
+                android:layout_width="match_parent"
+                android:layout_height="wrap_content"
+                android:text="Reset Steps"
+                android:textStyle="bold"
+                android:textColor="#FFFFFF"
+                android:background="@drawable/btn_blue_gradient"
+                android:padding="14dp"
+                android:elevation="8dp" />
+
+
+        </LinearLayout>
+
+    </LinearLayout>
+
+</ScrollView>
