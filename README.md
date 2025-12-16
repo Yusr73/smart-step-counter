@@ -27,7 +27,7 @@ Podomètre connecté avec double connectivité BLE/MQTT pour applications mobile
 
 <img width="656" alt="Dashboard web principal" src="https://github.com/user-attachments/assets/5867cea1-4e34-4d0a-ab74-2da9edfcbf87" />
 
-<img width="100" alt="Diagramme circulaire" src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" />
+<img width="600" alt="Diagramme circulaire" src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" />
 
 ## App Mobile :
 
