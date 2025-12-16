@@ -639,6 +639,9 @@ void setup() {
   
   SERIAL_PRINTLN("\n=== SETUP COMPLETE ===");
   SERIAL_PRINTLN("System ready. Waiting for BLE connection...\n");
+  
+
+  esp_sleep_enable_timer_wakeup(50 * 1000); // Réveil toutes les 50ms
 }
 
 /* ----------------------------
@@ -668,7 +671,7 @@ void loop() {
   
   // Publish steps via BLE - ONLY when goal is reached (lower rate)
   if (goalReachedToday) {
-    // ✅ Only periodic publishing AFTER goal reached
+    //  Only periodic publishing AFTER goal reached
     if (nowMs - lastPublishStepsMs >= publishStepsInterval_afterGoal) {
       lastPublishStepsMs = nowMs;
       publishStepsJson(nowMs);
@@ -678,6 +681,13 @@ void loop() {
   // Handle battery monitoring
   publishBatteryIfNeeded(nowMs);
   
-  // Small delay to prevent watchdog issues
-  delay(1);
+  //  MODIFICATION ICI (remplace le delay(1)) : 
+  static uint32_t lastActive = millis();
+  
+  // Si inactif pendant au moins 50ms → entre en light sleep
+  if (nowMs - lastActive >= 50) {
+    esp_light_sleep_start();  // Consomme ~0.8mA au lieu de ~25mA
+  }
+  
+  lastActive = millis();
 }
