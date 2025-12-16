@@ -23,16 +23,16 @@ Podomètre connecté avec double connectivité BLE/MQTT pour applications mobile
 - LED RGB
 - Batterie Li-Po 2000mAh
 
-## Dashboard Web :
+## Dashboard Web
 
-<img width="600" alt="Diagramme circulaire" src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" />
+<div style="display:flex; gap:16px;">
+  <img src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" width="48%" />
+  <img src="https://github.com/user-attachments/assets/5867cea1-4e34-4d0a-ab74-2da9edfcbf87" width="48%" />
+</div>
 
+## App Mobile
 
-<img width="656" alt="Dashboard web principal" src="https://github.com/user-attachments/assets/5867cea1-4e34-4d0a-ab74-2da9edfcbf87" />
-
-
-## App Mobile :
-
-<img width="360" alt="Écran principal mobile" src="https://github.com/user-attachments/assets/e038b7dd-4258-4a0c-a2f7-8d83daf11502" />
-
-<img width="360" alt="Écran statistiques mobile" src="https://github.com/user-attachments/assets/6d911a0e-89b7-4e08-a9a5-2e33425c6606" />
+<div style="display:flex; gap:16px;">
+  <img src="https://github.com/user-attachments/assets/e038b7dd-4258-4a0c-a2f7-8d83daf11502" width="48%" />
+  <img src="https://github.com/user-attachments/assets/6d911a0e-89b7-4e08-a9a5-2e33425c6606" width="48%" />
+</div>
