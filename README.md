@@ -24,7 +24,7 @@ Podomètre connecté avec double connectivité BLE/MQTT pour applications mobile
 - Batterie Li-Po 2000mAh
 
 ## Dashboard Web :
-<img width="563" height="756" alt="image" src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" />
+<img width="100" height="300" alt="image" src="https://github.com/user-attachments/assets/8644a09e-0035-4680-806a-32cdbf55d8d9" />
 
 <img width="656" height="872" alt="image" src="https://github.com/user-attachments/assets/5867cea1-4e34-4d0a-ab74-2da9edfcbf87" />
 
